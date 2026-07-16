@@ -1,3 +1,10 @@
+import os
+# ══════════════════════════════════════════════════════════════════════════════
+# VARIABLES DE ENTORNO PARA OPTIMIZAR TENSORFLOW EN PRODUCCIÓN (MODO CPU)
+# ══════════════════════════════════════════════════════════════════════════════
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Silencia advertencias innecesarias de TF e inicializaciones de CUDA
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -5,7 +12,6 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import joblib
-import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -17,7 +23,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # luego puedes restringir a tu dominio del frontend
+    allow_origins=["*"],  # Luego puedes restringir a tu dominio del frontend
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -27,6 +33,7 @@ app.add_middleware(
 # ══════════════════════════════════════════════════════════════════════════════
 TARGET = "precio_promedio"
 WINDOW_SIZE = 60
+
 # Obtener la ruta absoluta del directorio donde reside este archivo prediction_service.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "model_artifacts")
@@ -98,7 +105,7 @@ def agregar_por_horizonte(data_sc: np.ndarray, h: int, ops_agregacion: list) -> 
 
 
 def _transformar_ventana(datos_raw: np.ndarray, scaler_full, feat_idx_h: list,
-                          ops_agr_h: list, h: int, modo: str, window_base: int) -> np.ndarray:
+                         ops_agr_h: list, h: int, modo: str, window_base: int) -> np.ndarray:
     datos_sc = scaler_full.transform(datos_raw)[:, feat_idx_h]
 
     if modo == "agregado" and h > 1:
@@ -142,12 +149,16 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 
     # ── Predicción central (sin ruido) ──────────────────────────────────
     X_inf = _transformar_ventana(datos_raw_base, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base)
-    pred_sc = model.predict(X_inf, verbose=0)[0, 0]
+    
+    # Inferencia envuelta de forma segura en la CPU para evitar colisiones CUDA en producción
+    with tf.device('/CPU:0'):
+        pred_sc = model.predict(X_inf, verbose=0)[0, 0]
+        
     pred_inv = scaler_target.inverse_transform([[pred_sc]])[0, 0]
     pred_cop = float(precio_base_cop) * np.exp(pred_inv) if usar_diff else pred_inv
     
     col_std = datos_raw_base.std(axis=0)
-    col_std[col_std == 0] = 1e-9  # evita ruido nulo en columnas constantes
+    col_std[col_std == 0] = 1e-9  # Evita ruido nulo en columnas constantes
 
     preds_boot = []
     for _ in range(N_BOOTSTRAP):
@@ -155,7 +166,11 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
         datos_raw_noisy = datos_raw_base + noise
 
         X_boot = _transformar_ventana(datos_raw_noisy, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base)
-        p_sc = model.predict(X_boot, verbose=0)[0, 0]
+        
+        # Simulación de bootstrap corrida de manera segura en CPU
+        with tf.device('/CPU:0'):
+            p_sc = model.predict(X_boot, verbose=0)[0, 0]
+            
         p_inv = scaler_target.inverse_transform([[p_sc]])[0, 0]
         p_cop = float(precio_base_cop) * np.exp(p_inv) if usar_diff else p_inv
 
@@ -164,7 +179,7 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
     
     if len(preds_boot) < 2:
         # Bootstrap degenerado (todas las muestras cayeron no-finitas):
-        # no hay base para estimar dispersión, colapsamos el IC al punto.
+        # No hay base para estimar dispersión, colapsamos el IC al punto.
         ic_inf, ic_sup = pred_cop, pred_cop
     else:
         ic_inf, ic_sup = np.percentile(preds_boot, [2.5, 97.5])
@@ -198,6 +213,7 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 # ══════════════════════════════════════════════════════════════════════════════
 # AUXILIARES Y ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
+
 def cargar_artefactos_con_cache(modelo_key: str, h: int):
     """Carga los modelos en memoria una sola vez para optimizar las llamadas."""
     cache_key = f"{modelo_key}_h{h}"
@@ -209,25 +225,28 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
         sf_path = os.path.join(MODELS_DIR, f"scaler_full_{modelo_key}.pkl")
         st_path = os.path.join(MODELS_DIR, f"scaler_target_{modelo_key}.pkl")
         
-        # 👇 LÍNEA DE DEPURACIÓN AÑADIDA
+        # Línea de depuración para verificar la ruta física real en producción
         print(f"[DEBUG ARTEFACTOS] Buscando archivos en ruta absoluta: {model_path}")
         
         if not os.path.exists(model_path) or not os.path.exists(sf_path) or not os.path.exists(st_path):
-            # Mejoramos el mensaje de error para saber exactamente qué archivo no encuentra
             faltantes = [p for p in [model_path, sf_path, st_path] if not os.path.exists(p)]
             raise FileNotFoundError(
                 f"Faltan archivos binarios de la red neuronal o scalers. Faltantes: {faltantes}"
             )
             
-        model = tf.keras.models.load_model(model_path)
+        # Carga del modelo TensorFlow asegurando aislamiento en CPU y evitando recompilaciones fallidas de Keras
+        with tf.device('/CPU:0'):
+            model = tf.keras.models.load_model(model_path, compile=False)
+            
         scaler_full = joblib.load(sf_path)
         scaler_target = joblib.load(st_path)
         
-        # Guardar en cache para futuros requests
+        # Guardar en caché para futuros requests
         MODEL_CACHE[cache_key] = (model, scaler_full, scaler_target)
         return model, scaler_full, scaler_target
     except Exception as e:
         raise RuntimeError(f"Error crítico cargando la arquitectura del modelo: {str(e)}")
+
 
 @app.get("/predict")
 def ejecutar_inferencia(
@@ -294,6 +313,7 @@ def ejecutar_inferencia(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Falla interna en la predicción de la red: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
