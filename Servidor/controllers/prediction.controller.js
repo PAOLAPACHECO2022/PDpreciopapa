@@ -25,18 +25,21 @@ exports.getPrediction = async (req, res) => {
 
     // 2. Comunicarse con el microservicio de FastAPI (Puerto 8000)
     // Pasamos TODO el bloque de parámetros que capturamos del agricultor
+    // Asegurar que use la URL correcta concatenada
     const pythonResponse = await axios.get(
-      process.env.FASTAPI_URL || "http://localhost:8000/predict",
+      `${process.env.FASTAPI_URL || "http://localhost:8000"}/predict`,
       {
         params: {
           producto,
           horizonte,
-          precio_promedio,
-          Cant_Ton_Total,
-          costo_total,
-          tmedia_c,
-          tmedia_c_lag20,
-          prec30_mm,
+          precio_promedio: precio_promedio
+            ? Number(precio_promedio)
+            : undefined,
+          Cant_Ton_Total: Cant_Ton_Total ? Number(Cant_Ton_Total) : undefined,
+          costo_total: costo_total ? Number(costo_total) : undefined,
+          tmedia_c: tmedia_c ? Number(tmedia_c) : undefined,
+          tmedia_c_lag20: tmedia_c_lag20 ? Number(tmedia_c_lag20) : undefined,
+          prec30_mm: prec30_mm ? Number(prec30_mm) : undefined,
         },
       },
     );
