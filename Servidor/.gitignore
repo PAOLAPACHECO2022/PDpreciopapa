@@ -1,0 +1,14 @@
+# Evitar subir credenciales y configuración local
+.env
+.env.local
+
+# Dependencias (si usas Node/React)
+node_modules/
+dist/
+build/
+
+# Entornos virtuales y caché (si usas Python)
+venv/
+.venv/
+__pycache__/
+*.pyc

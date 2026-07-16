@@ -1,0 +1,86 @@
+/* --- ESTILOS BASE DE LA APLICACIÓN --- */
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  background-color: #f8f9fa; /* Fondo de respaldo por si no carga la imagen */
+}
+
+/* CORRECCIÓN CRÍTICA: Convertimos .App en un contenedor Flexbox 
+  para organizar verticalmente el Navbar, el Contenido y el Footer.
+*/
+
+/* Contenedor base de la aplicación (Sin imagen de fondo fija) */
+.App {
+  display: flex;
+  flex-direction: column; 
+  min-height: 100vh;
+}
+
+/* NUEVA CLASE: Esta clase SOLO se aplicará en Login y Registro */
+.bg-auth-image {
+  background-image: url("../public/papab.png");
+  background-repeat: no-repeat;
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed; /* Mantiene el fondo quieto al hacer scroll */
+}
+
+/* --- ESTILOS DE ESTRUCTURA Y FORMULARIOS --- */
+.wrapper {
+  padding-top: 30px;
+}
+
+body h3 {
+  margin-bottom: 25px;
+}
+
+.navbar-brand a {
+  color: #ffffff;
+}
+
+.form-wrapper,
+.table-wrapper {
+  max-width: 500px;
+  margin: 0 auto;
+}
+
+.table-wrapper {
+  max-width: 700px;
+}
+
+/* --- BOTONES Y ENLACES --- */
+.edit-link {
+  padding: 7px 10px;
+  font-size: 0.875rem;
+  line-height: normal;
+  border-radius: 0.2rem;
+  color: #fff;
+  background-color: #28a745;
+  border-color: #28a745;
+  margin-right: 10px;
+  position: relative;
+  top: 1px;
+}
+
+.edit-link:hover {
+  text-decoration: none;
+  color: #ffffff;
+}
+
+.btn-profile img {
+  transition: transform 0.2s ease-in-out;
+}
+
+.btn-profile img:hover {
+  transform: scale(1.05);
+}
+
+/* --- FOOTER OPTIMIZADO --- */
+footer {
+  background-color: black !important;
+  color: rgb(101, 189, 20);
+  width: 100%;
+  padding: 20px 0;
+  margin-top: auto; /* CORRECCIÓN: Empuja el footer al fondo de la pantalla sin romper el diseño */
+}
