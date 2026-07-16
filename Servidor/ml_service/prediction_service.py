@@ -325,6 +325,176 @@ def ejecutar_inferencia(
         raise HTTPException(status_code=500, detail=f"Falla interna en la predicción de la red: {str(e)}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CURVA DIARIA (día 1 a día 30) — Recursivo h=1 calibrado con anclas h=7/h=30
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual_base: float, dias: int = 30) -> list:
+    """
+    Genera una curva de precios DIARIOS (día 1 a `dias`) a partir de:
+    - Forecasting recursivo con el modelo h=1 (predice día a día, alimentando
+      cada predicción como insumo para la siguiente).
+    - Calibración con los modelos h=7 y h=30 como "anclas": la curva recursiva
+      se corrige para que pase exactamente por esos dos puntos, ya que esos
+      modelos fueron entrenados específicamente para esos horizontes.
+
+    LIMITACIÓN IMPORTANTE: las variables exógenas (clima, costos, toneladas)
+    se mantienen constantes en su último valor conocido durante toda la
+    recursión, porque no existe un pronóstico real de esas variables a
+    futuro. Esto es una aproximación, no una predicción certera día a día.
+    """
+    model_h1, sf_h1, st_h1 = cargar_artefactos_con_cache(producto, 1)
+    cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
+
+    features = cfg["features"]
+    ops_agr = cfg["ops_agregacion"]
+    params = cfg["params"]
+    usar_diff = params["DIFERENCIAR"]
+    window_base = params["WINDOW_SIZE"]
+    modo = cfg.get("modo_secuencia", "agregado")
+
+    features_h1 = cfg.get("features_por_horizonte", {}).get(1, features)
+    feat_idx_h1 = [features.index(f) for f in features_h1]
+    ops_agr_h1 = [ops_agr[i] for i in feat_idx_h1]
+
+    # Copia de trabajo del histórico que se irá extendiendo día a día
+    df_trabajo = df_reciente[features].copy()
+
+    ultima_fecha = df_trabajo.index[-1]
+    ultima_fila_exogenas = df_trabajo.iloc[-1].copy()  # se mantiene constante
+
+    curva_recursiva = []
+
+    for dia in range(1, dias + 1):
+        # Preparamos la ventana según si el modelo usa diferenciación o no
+        if usar_diff:
+            df_diff = df_trabajo.copy()
+            df_diff[TARGET] = np.log(df_diff[TARGET] / df_diff[TARGET].shift(1))
+            df_diff = df_diff.iloc[1:]
+            datos_raw = df_diff.tail(window_base).values
+            precio_ancla_paso = float(df_trabajo[TARGET].iloc[-1])
+        else:
+            datos_raw = df_trabajo.tail(window_base).values
+            precio_ancla_paso = None
+
+        if len(datos_raw) < window_base:
+            break  # histórico insuficiente para seguir extrapolando
+
+        X_inf = _transformar_ventana(datos_raw, sf_h1, feat_idx_h1, ops_agr_h1, 1, modo, window_base)
+
+        # Inferencia envuelta de forma segura en la CPU, igual que en predecir_nuevos_datos
+        with tf.device('/CPU:0'):
+            pred_sc = model_h1.predict(X_inf, verbose=0)[0, 0]
+
+        pred_inv = st_h1.inverse_transform([[pred_sc]])[0, 0]
+        pred_cop = precio_ancla_paso * np.exp(pred_inv) if usar_diff else pred_inv
+
+        if not np.isfinite(pred_cop) or pred_cop <= 0:
+            break  # divergencia numérica, detenemos la recursión
+
+        fecha_dia = ultima_fecha + pd.Timedelta(days=dia)
+        curva_recursiva.append({"fecha": fecha_dia, "dia": dia, "precio_recursivo": float(pred_cop)})
+
+        # Agregamos la predicción como nueva fila histórica, manteniendo
+        # las exógenas constantes en su último valor real conocido.
+        nueva_fila = ultima_fila_exogenas.copy()
+        nueva_fila[TARGET] = pred_cop
+        df_trabajo.loc[fecha_dia] = nueva_fila
+
+    if not curva_recursiva:
+        raise ValueError("No fue posible generar la curva diaria: histórico insuficiente.")
+
+    # ── Calibración con anclas h=7 y h=30 ───────────────────────────────
+    anclas = {}
+    for h_ancla in [7, 30]:
+        if h_ancla <= len(curva_recursiva):
+            try:
+                model_h, sf_h, st_h = cargar_artefactos_con_cache(producto, h_ancla)
+                resultado_ancla = predecir_nuevos_datos(
+                    model_h, sf_h, st_h, df_reciente, h_ancla, producto, precio_actual_base
+                )
+                anclas[h_ancla] = resultado_ancla["precio_predicho_COP_kg"]
+            except Exception:
+                pass  # si falta el artefacto de ese horizonte, seguimos sin esa ancla
+
+    # Distribuimos la corrección (diferencia entre curva recursiva y ancla)
+    # de forma lineal entre los tramos [0, 7] y [7, 30], para que la curva
+    # pase exactamente por los puntos confiables sin saltos bruscos.
+    residual_7 = anclas.get(7, curva_recursiva[6]["precio_recursivo"]) - curva_recursiva[6]["precio_recursivo"] if len(curva_recursiva) >= 7 else 0
+    residual_30 = anclas.get(30, curva_recursiva[-1]["precio_recursivo"]) - curva_recursiva[-1]["precio_recursivo"] if len(curva_recursiva) >= 30 else residual_7
+
+    curva_final = []
+    for punto in curva_recursiva:
+        d = punto["dia"]
+        if d <= 7:
+            correccion = residual_7 * (d / 7)
+        else:
+            frac = (d - 7) / max(30 - 7, 1)
+            correccion = residual_7 + (residual_30 - residual_7) * frac
+
+        precio_calibrado = punto["precio_recursivo"] + correccion
+        curva_final.append({
+            "fecha": punto["fecha"].strftime("%Y-%m-%d"),
+            "dia": d,
+            "precio_predicho_COP_kg": round(float(precio_calibrado), 2),
+            "es_ancla": d in (7, 30) and d in anclas,
+        })
+
+    return curva_final
+
+
+@app.get("/predict/curve")
+def ejecutar_curva_diaria(
+    producto: str,
+    dias: int = Query(30, ge=1, le=30),
+    precio_promedio: Optional[float] = None,
+    Cant_Ton_Total: Optional[float] = None,
+    costo_total: Optional[float] = None,
+    tmedia_c: Optional[float] = None,
+    tmedia_c_lag20: Optional[float] = None,
+    prec30_mm: Optional[float] = None
+):
+    cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
+    if not cfg:
+        raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
+
+    try:
+        idx = pd.date_range(end=pd.Timestamp.now(), periods=95, freq='D')
+        df_reciente = pd.DataFrame({
+            "precio_promedio": np.random.uniform(2300, 2600, 95),
+            "tmedia_c": np.random.uniform(14, 18, 95),
+            "tmedia_c_lag20": np.random.uniform(14, 18, 95),
+            "prec30_mm": np.random.uniform(10, 60, 95),
+            "Cant_Ton_Total": np.random.uniform(150, 350, 95),
+            "costo_total": np.random.uniform(1500, 2200, 95)
+        }, index=idx)
+
+        if precio_promedio is not None: df_reciente.iloc[-1, df_reciente.columns.get_loc("precio_promedio")] = precio_promedio
+        if tmedia_c is not None:        df_reciente.iloc[-1, df_reciente.columns.get_loc("tmedia_c")] = tmedia_c
+        if tmedia_c_lag20 is not None:  df_reciente.iloc[-1, df_reciente.columns.get_loc("tmedia_c_lag20")] = tmedia_c_lag20
+        if prec30_mm is not None:       df_reciente.iloc[-1, df_reciente.columns.get_loc("prec30_mm")] = prec30_mm
+        if Cant_Ton_Total is not None:  df_reciente.iloc[-1, df_reciente.columns.get_loc("Cant_Ton_Total")] = Cant_Ton_Total
+        if costo_total is not None:     df_reciente.iloc[-1, df_reciente.columns.get_loc("costo_total")] = costo_total
+
+        df_reciente = df_reciente.interpolate(method="time").ffill().bfill()
+        precio_actual_base = float(df_reciente[TARGET].iloc[-1])
+
+        curva = generar_curva_diaria(producto, df_reciente, precio_actual_base, dias=dias)
+
+        return {
+            "status": "success",
+            "modelo_key": producto,
+            "dias_generados": len(curva),
+            "metodologia": "Recursivo h=1 calibrado con anclas h=7/h=30",
+            "curva": curva,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falla generando la curva diaria: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
