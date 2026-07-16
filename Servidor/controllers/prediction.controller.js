@@ -123,3 +123,27 @@ exports.ejecutarBatchManual = async (req, res) => {
       .json({ message: "Error ejecutando el batch.", error: error.message });
   }
 };
+exports.getPredictionCurve = async (req, res) => {
+  try {
+    const { producto, dias, precio_promedio, Cant_Ton_Total, costo_total, tmedia_c, tmedia_c_lag20, prec30_mm } = req.query;
+
+    if (!producto) {
+      return res.status(400).json({ message: "Falta el parámetro requerido: producto." });
+    }
+
+    const baseUrl = (process.env.FASTAPI_URL || "http://localhost:8000/predict").replace("/predict", "/predict/curve");
+
+    const pythonResponse = await axios.get(baseUrl, {
+      params: { producto, dias, precio_promedio, Cant_Ton_Total, costo_total, tmedia_c, tmedia_c_lag20, prec30_mm },
+      timeout: 60000, // la recursión de 30 pasos tarda más que una predicción simple
+    });
+
+    return res.status(200).json(pythonResponse.data);
+  } catch (error) {
+    console.error("Error obteniendo la curva diaria de predicción:", error.message);
+    return res.status(500).json({
+      message: "Error al generar la curva diaria de precios.",
+      error: error.message,
+    });
+  }
+};
