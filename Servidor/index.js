@@ -17,10 +17,31 @@ const { iniciarJobProgramado } = require("./jobs/predictionJob");
 
 const app = express();
 
+// 🛠️ Configuración de CORS con Orígenes Permitidos
+// Esto permite que tu frontend en Render y tus pruebas locales se conecten sin bloqueos
+const allowedOrigins = [
+  "https://pdpreciopapa.onrender.com", // Tu frontend en Render
+  "http://localhost:3000",             // React local estándar
+  "http://localhost:5173"              // Vite local estándar (por si acaso)
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permitir peticiones sin origen (como Postman o peticiones del mismo servidor)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error("Bloqueado por políticas de CORS (origen no permitido)"));
+    }
+  },
+  credentials: true
+}));
+
 // 🛠️ Middlewares de parsing y seguridad
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(cors());
 
 // 📍 Rutas de la API
 app.use("/users", userRoute);
