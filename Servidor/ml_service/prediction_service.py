@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import numpy as np
 import pandas as pd
@@ -14,6 +15,13 @@ app = FastAPI(
     version="7.12"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # luego puedes restringir a tu dominio del frontend
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIONES GLOBALES REPLICADAS DEL MODELO ORIGINAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -21,17 +29,8 @@ TARGET = "precio_promedio"
 WINDOW_SIZE = 60
 MODELS_DIR = "./model_artifacts"
 
-# Horizontes válidos globalmente admitidos por la API.
-# NOTA: no todos los modelos tienen necesariamente artefactos entrenados para
-# los 3 horizontes; si falta el .keras/.pkl correspondiente, el endpoint
-# devolverá un 500 explicando que faltan los archivos binarios.
 HORIZONTES_VALIDOS = [1, 7, 30]
 
-# 🔧 v7.12: parámetros del bootstrap, ahora centralizados aquí. El ruido se
-# expresa como fracción de la desviación estándar histórica de cada variable
-# CRUDA (antes de escalar), no como un sigma fijo en espacio escalado. Esto
-# es lo que permite reutilizar el mismo criterio de ruido sin importar si el
-# modelo agrega por bloques (h=7/h=30) o no (h=1).
 N_BOOTSTRAP = 50
 RUIDO_FRAC_STD = 0.01  # 1% de la desviación histórica de cada variable cruda
 
@@ -96,21 +95,6 @@ def agregar_por_horizonte(data_sc: np.ndarray, h: int, ops_agregacion: list) -> 
     return result
 
 
-# 🔧 v7.12: extraído del cuerpo de predecir_nuevos_datos para poder correr el
-# MISMO pipeline (escalar -> filtrar columnas del horizonte -> agregar por
-# bloques si aplica) tanto sobre los datos base como sobre cada muestra
-# bootstrap perturbada. Antes el ruido bootstrap se inyectaba directamente
-# sobre X_inf (el tensor YA escalado/agregado), lo que en la práctica
-# significaba tratamientos distintos por horizonte:
-#   - h=1 (modo "directo"): ruido cae sobre datos escalados fila a fila.
-#   - h=7/h=30 (modo "agregado"): ruido cae sobre bloques YA promediados/
-#     sumados, es decir sobre una escala numérica distinta y con memoria de
-#     varias filas por punto. El ancho resultante del IC no era comparable
-#     entre horizontes, solo un artefacto de en qué punto del pipeline se
-#     inyectaba el ruido.
-# Ahora el ruido se inyecta sobre los datos CRUDOS (antes de escalar) y se
-# reconstruye la secuencia completa para cada muestra, así el criterio de
-# perturbación es idéntico sin importar el horizonte.
 def _transformar_ventana(datos_raw: np.ndarray, scaler_full, feat_idx_h: list,
                           ops_agr_h: list, h: int, modo: str, window_base: int) -> np.ndarray:
     datos_sc = scaler_full.transform(datos_raw)[:, feat_idx_h]
@@ -159,12 +143,7 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
     pred_sc = model.predict(X_inf, verbose=0)[0, 0]
     pred_inv = scaler_target.inverse_transform([[pred_sc]])[0, 0]
     pred_cop = float(precio_base_cop) * np.exp(pred_inv) if usar_diff else pred_inv
-
-    # ── Bootstrap metodológicamente consistente entre horizontes ───────
-    # 🔧 v7.12: ruido gaussiano proporcional a la desviación histórica de
-    # cada variable cruda, inyectado ANTES de escalar/filtrar/agregar, y el
-    # pipeline completo (_transformar_ventana) se re-ejecuta por cada
-    # muestra. Así h=1, h=7 y h=30 reciben el mismo tratamiento relativo.
+    
     col_std = datos_raw_base.std(axis=0)
     col_std[col_std == 0] = 1e-9  # evita ruido nulo en columnas constantes
 
@@ -180,11 +159,7 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 
         if np.isfinite(p_cop):
             preds_boot.append(p_cop)
-
-    # 🔧 v7.12: IC por percentiles 2.5/97.5 en vez de media ± 2σ. Como
-    # usar_diff=True aplica exp() (transformación no lineal), la
-    # distribución bootstrap puede quedar asimétrica; los percentiles no
-    # asumen simetría y son más honestos que un intervalo gaussiano.
+    
     if len(preds_boot) < 2:
         # Bootstrap degenerado (todas las muestras cayeron no-finitas):
         # no hay base para estimar dispersión, colapsamos el IC al punto.
@@ -192,12 +167,7 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
     else:
         ic_inf, ic_sup = np.percentile(preds_boot, [2.5, 97.5])
 
-    # ── Guardas contra valores degenerados antes de responder ──────────
-    # 🔧 v7.12: si la predicción central no es finita o no es positiva
-    # (posible si el modelo diverge o precio_base_cop es anómalo, dado que
-    # usar_diff aplica exp() sobre un precio base), es un resultado inválido
-    # de negocio (no existen precios negativos) y debe fallar explícitamente
-    # en vez de devolver un IC engañoso.
+    
     if not np.isfinite(pred_cop) or pred_cop <= 0:
         raise ValueError(
             f"Predicción no válida (no positiva o no finita) para "
@@ -207,9 +177,6 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
     if not np.isfinite(ic_inf) or not np.isfinite(ic_sup):
         ic_inf, ic_sup = pred_cop, pred_cop
 
-    # Por seguridad, garantiza orden correcto (percentiles ya vienen
-    # ordenados, pero si el bootstrap colapsó al punto o hubo algún caso
-    # límite, esto evita un IC invertido llegando al frontend).
     ic_inf, ic_sup = min(ic_inf, ic_sup), max(ic_inf, ic_sup)
 
     # Sincronización de fecha destino
