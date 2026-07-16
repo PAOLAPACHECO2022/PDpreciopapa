@@ -27,7 +27,9 @@ app.add_middleware(
 # ══════════════════════════════════════════════════════════════════════════════
 TARGET = "precio_promedio"
 WINDOW_SIZE = 60
-MODELS_DIR = "./model_artifacts"
+# Obtener la ruta absoluta del directorio donde reside este archivo prediction_service.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "model_artifacts")
 
 HORIZONTES_VALIDOS = [1, 7, 30]
 
@@ -196,7 +198,6 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 # ══════════════════════════════════════════════════════════════════════════════
 # AUXILIARES Y ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
-
 def cargar_artefactos_con_cache(modelo_key: str, h: int):
     """Carga los modelos en memoria una sola vez para optimizar las llamadas."""
     cache_key = f"{modelo_key}_h{h}"
@@ -208,10 +209,14 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
         sf_path = os.path.join(MODELS_DIR, f"scaler_full_{modelo_key}.pkl")
         st_path = os.path.join(MODELS_DIR, f"scaler_target_{modelo_key}.pkl")
         
+        # 👇 LÍNEA DE DEPURACIÓN AÑADIDA
+        print(f"[DEBUG ARTEFACTOS] Buscando archivos en ruta absoluta: {model_path}")
+        
         if not os.path.exists(model_path) or not os.path.exists(sf_path) or not os.path.exists(st_path):
+            # Mejoramos el mensaje de error para saber exactamente qué archivo no encuentra
+            faltantes = [p for p in [model_path, sf_path, st_path] if not os.path.exists(p)]
             raise FileNotFoundError(
-                f"Faltan archivos binarios de la red neuronal o scalers para "
-                f"modelo_key='{modelo_key}' y horizonte h={h}."
+                f"Faltan archivos binarios de la red neuronal o scalers. Faltantes: {faltantes}"
             )
             
         model = tf.keras.models.load_model(model_path)
