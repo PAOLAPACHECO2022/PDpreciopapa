@@ -31,7 +31,7 @@ MODELS_DIR = "./model_artifacts"
 
 HORIZONTES_VALIDOS = [1, 7, 30]
 
-N_BOOTSTRAP = 50
+N_BOOTSTRAP = 15
 RUIDO_FRAC_STD = 0.01  # 1% de la desviación histórica de cada variable cruda
 
 MODELOS_CONFIG = [
