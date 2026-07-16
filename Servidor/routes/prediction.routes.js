@@ -11,6 +11,7 @@ router.get('/agro-predictions', predictionController.getPrediction);
 router.get('/predictions-history', predictionController.getPredictionsHistory);
 
 router.post("/predictions/run-batch", predictionController.ejecutarBatchManual);
+router.get("/prediction-curve", predictionController.getPredictionCurve);
 
 module.exports = router;
 
