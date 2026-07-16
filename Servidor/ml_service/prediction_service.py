@@ -13,6 +13,7 @@ import pandas as pd
 import tensorflow as tf
 import joblib
 import warnings
+import traceback 
 warnings.filterwarnings("ignore")
 
 app = FastAPI(
@@ -213,7 +214,6 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 # ══════════════════════════════════════════════════════════════════════════════
 # AUXILIARES Y ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
-
 def cargar_artefactos_con_cache(modelo_key: str, h: int):
     """Carga los modelos en memoria una sola vez para optimizar las llamadas."""
     cache_key = f"{modelo_key}_h{h}"
@@ -225,7 +225,6 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
         sf_path = os.path.join(MODELS_DIR, f"scaler_full_{modelo_key}.pkl")
         st_path = os.path.join(MODELS_DIR, f"scaler_target_{modelo_key}.pkl")
         
-        # Línea de depuración para verificar la ruta física real en producción
         print(f"[DEBUG ARTEFACTOS] Buscando archivos en ruta absoluta: {model_path}")
         
         if not os.path.exists(model_path) or not os.path.exists(sf_path) or not os.path.exists(st_path):
@@ -234,10 +233,19 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
                 f"Faltan archivos binarios de la red neuronal o scalers. Faltantes: {faltantes}"
             )
             
-        # Carga del modelo TensorFlow asegurando aislamiento en CPU y evitando recompilaciones fallidas de Keras
-        with tf.device('/CPU:0'):
-            model = tf.keras.models.load_model(model_path, compile=False)
+        # Carga ultra-segura aislando hilos y desactivando optimizaciones de compilación
+        print(f"[DEBUG TENSORFLOW] Intentando deserializar {model_path} con compile=False en CPU...")
+        try:
+            with tf.device('/CPU:0'):
+                # Usamos custom_objects vacíos para evitar que Keras intente buscar capas personalizadas antiguas
+                model = tf.keras.models.load_model(model_path, compile=False, custom_objects={})
+            print("[DEBUG TENSORFLOW] ¡Modelo cargado exitosamente en CPU!")
+        except Exception as tf_err:
+            print(f"[FATAL TENSORFLOW] Error directo de TensorFlow al cargar {model_path}:")
+            traceback.print_exc()  # Esto imprimirá la traza completa (línea por línea) en los logs de Render
+            raise tf_err
             
+        # Carga de Scalers
         scaler_full = joblib.load(sf_path)
         scaler_target = joblib.load(st_path)
         
@@ -245,7 +253,9 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
         MODEL_CACHE[cache_key] = (model, scaler_full, scaler_target)
         return model, scaler_full, scaler_target
     except Exception as e:
-        raise RuntimeError(f"Error crítico cargando la arquitectura del modelo: {str(e)}")
+        # Esto permite que el error detallado suba hasta la respuesta de tu API HTTP 500 para poder verlo en consola
+        error_detallado = f"{str(e)} | Trace: {traceback.format_exc()[-250:]}"
+        raise RuntimeError(f"Error crítico cargando la arquitectura del modelo: {error_detallado}")
 
 
 @app.get("/predict")
