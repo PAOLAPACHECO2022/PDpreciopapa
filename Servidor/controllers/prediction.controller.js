@@ -27,7 +27,7 @@ exports.getPrediction = async (req, res) => {
     // Pasamos TODO el bloque de parámetros que capturamos del agricultor
     // Asegurar que use la URL correcta concatenada
     const pythonResponse = await axios.get(
-      `${process.env.FASTAPI_URL || "http://localhost:8000"}/predict/curve`,
+      `${process.env.FASTAPI_URL || "http://localhost:8000"}/predict`,
       {
         params: {
           producto,
@@ -141,10 +141,7 @@ exports.getPredictionCurve = async (req, res) => {
       return res.status(400).json({ message: "Falta el parámetro requerido: producto." });
     }
 
-    const baseUrl = (process.env.FASTAPI_URL || "http://localhost:8000").replace(
-      "/predict",
-      "/predict/curve"
-    );
+    const baseUrl = `${process.env.FASTAPI_URL || "http://localhost:8000"}/predict/curve`;    
 
     const pythonResponse = await axios.get(baseUrl, {
       params: {
