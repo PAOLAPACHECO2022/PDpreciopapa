@@ -1,4 +1,3 @@
-// ______________________CODIGO 1 (FUSIONADO CON CODIGO 2)_______________
 import React, { useState, useMemo } from "react";
 import {
   Card,
@@ -9,6 +8,7 @@ import {
   Spinner,
   Alert,
   Accordion,
+  Badge,
 } from "react-bootstrap";
 import {
   ResponsiveContainer,
@@ -20,6 +20,8 @@ import {
   Tooltip,
   Legend,
   Line,
+  ComposedChart,
+  Dot,
   RadarChart,
   PolarGrid,
   PolarAngleAxis,
@@ -40,6 +42,8 @@ import {
   ScanLine,
   Gauge,
   PiggyBank,
+  Sparkles,
+  AlertTriangle,
 } from "lucide-react";
 
 // Importación de tu instancia personalizada de Axios con interceptores de Token
@@ -618,6 +622,30 @@ export function MarginDonut({ costo, precio, color }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 🆕 NUEVO: Punto personalizado para la curva diaria. Los días con modelo
+// dedicado (1, 7, 30 — marcados por el backend con "es_ancla": true) se
+// dibujan más grandes y sólidos; los días interpolados entre esas anclas
+// se dibujan pequeños, para comunicar visualmente que no tienen el mismo
+// respaldo de precisión.
+// ─────────────────────────────────────────────────────────────────────────
+function CurvaDot(props) {
+  const { cx, cy, payload, color } = props;
+  if (payload?.es_ancla) {
+    return (
+      <Dot
+        cx={cx}
+        cy={cy}
+        r={6}
+        fill={TOKENS.primaryDark}
+        stroke="#fff"
+        strokeWidth={2}
+      />
+    );
+  }
+  return <Dot cx={cx} cy={cy} r={2.5} fill={color} stroke="none" />;
+}
+
 // Inyección dinámica de CSS para sliders nativos estilizados + animación shimmer (de Código 2)
 if (typeof document !== "undefined") {
   const styleEl = document.createElement("style");
@@ -656,11 +684,18 @@ const PredictionPanel = () => {
   const [tmediaC, setTmediaC] = useState(16);
   const [prec30Mm, setPrec30Mm] = useState(120);
 
-  // Estados de control de UI
+  // Estados de control de UI (predicción puntual)
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [chartData, setChartData] = useState([]);
+
+  // 🆕 Estados de control de UI (curva diaria recursiva)
+  const [diasCurva, setDiasCurva] = useState(30);
+  const [loadingCurva, setLoadingCurva] = useState(false);
+  const [curvaData, setCurvaData] = useState([]);
+  const [curvaMeta, setCurvaMeta] = useState(null);
+  const [errorCurva, setErrorCurva] = useState(null);
 
   const modeloActivo = MODELOS[producto] || MODELOS.papa_negra;
 
@@ -768,6 +803,52 @@ const PredictionPanel = () => {
       );
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 🆕 CURVA DIARIA: reutiliza EXACTAMENTE las mismas variables exógenas del
+  // acordeón (precioPromedio, tmediaC, prec30Mm, cantTonTotal, costoTotal).
+  // No hace falta replicar featuresActivas aquí: el endpoint /predict/curve
+  // ya arma internamente el DataFrame con las 6 columnas y filtra por sí
+  // mismo cuáles usa cada horizonte (h=1 para la recursión, h=7/h=30 como
+  // anclas de calibración). Enviar todos los valores disponibles es seguro
+  // incluso si el horizonte puntual seleccionado arriba no los usa todos.
+  const generarCurvaDiaria = async () => {
+    setLoadingCurva(true);
+    setErrorCurva(null);
+    setCurvaData([]);
+    setCurvaMeta(null);
+
+    const paramsPayload = {
+      producto,
+      dias: diasCurva,
+      precio_promedio: precioPromedio,
+      tmedia_c: tmediaC,
+      tmedia_c_lag20: tmediaC,
+      prec30_mm: prec30Mm,
+      Cant_Ton_Total: cantTonTotal,
+      costo_total: costoTotal,
+    };
+
+    try {
+      const res = await API.get("/api/prediction-curve", {
+        params: paramsPayload,
+      });
+      if (res.data && res.data.curva) {
+        setCurvaData(res.data.curva);
+        setCurvaMeta({
+          dias_generados: res.data.dias_generados,
+          metodologia: res.data.metodologia,
+        });
+      }
+    } catch (err) {
+      console.error("Error generando la curva diaria:", err);
+      setErrorCurva(
+        err.response?.data?.message ||
+          "No se pudo generar la curva diaria. Verifica que el motor LSTM esté activo.",
+      );
+    } finally {
+      setLoadingCurva(false);
     }
   };
 
@@ -894,6 +975,13 @@ const PredictionPanel = () => {
       fontWeight: "bold",
       boxShadow: `0 4px 10px ${TOKENS.primary}44`,
     },
+    curvaButton: {
+      background: TOKENS.surface,
+      border: `2px solid ${TOKENS.primaryDark}`,
+      color: TOKENS.primaryDark,
+      padding: "11px 20px",
+      fontWeight: "bold",
+    },
   };
   return (
     <Card
@@ -969,6 +1057,48 @@ const PredictionPanel = () => {
                   </>
                 ) : (
                   "Simular Precio"
+                )}
+              </Button>
+            </Col>
+          </Row>
+
+          {/* 🆕 Fila de controles para la curva diaria — reutiliza las mismas
+              variables del acordeón de abajo, no requiere inputs propios. */}
+          <Row className="g-3 align-items-end mt-1">
+            <Col xs={12} sm={6} md={4}>
+              <Form.Group>
+                <Form.Label style={brandStyles.label}>
+                  Proyección Diaria — Días a Simular
+                </Form.Label>
+                <Form.Select
+                  value={diasCurva}
+                  onChange={(e) => setDiasCurva(parseInt(e.target.value))}
+                  style={brandStyles.selectStyle}
+                  className="rounded-3 shadow-sm"
+                >
+                  <option value={7}>7 días</option>
+                  <option value={15}>15 días</option>
+                  <option value={30}>30 días</option>
+                </Form.Select>
+              </Form.Group>
+            </Col>
+
+            <Col xs={12} sm={6} md={4}>
+              <Button
+                style={brandStyles.curvaButton}
+                className="w-100 fw-bold rounded-3 d-flex align-items-center justify-content-center gap-2"
+                onClick={generarCurvaDiaria}
+                disabled={loadingCurva}
+              >
+                {loadingCurva ? (
+                  <>
+                    <Spinner animation="border" size="sm" />
+                    Simulando {diasCurva} días...
+                  </>
+                ) : (
+                  <>
+                    <TrendingUp size={16} /> Ver Proyección Diaria
+                  </>
                 )}
               </Button>
             </Col>
@@ -1121,6 +1251,160 @@ const PredictionPanel = () => {
           </Alert>
         )}
 
+        {/* 🆕 CURVA DIARIA — errores propios, independientes de la predicción puntual */}
+        {errorCurva && (
+          <Alert
+            variant="danger"
+            className="rounded-3 border-0 mt-3 p-3 text-danger d-flex flex-column"
+            style={{
+              background: TOKENS.riskSoft,
+              borderLeft: `4px solid ${TOKENS.risk}`,
+            }}
+          >
+            <span className="fw-bold">⚠️ Error en Proyección Diaria</span>
+            <span style={{ fontSize: "12.5px" }} className="mt-1">
+              {errorCurva}
+            </span>
+          </Alert>
+        )}
+
+        {/* 🆕 CURVA DIARIA — resultado */}
+        {curvaData.length > 0 && !loadingCurva && (
+          <Card className="border-0 shadow-sm bg-white p-4 rounded-4 mt-3">
+            <div className="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+              <h6
+                className="fw-bold mb-0 d-flex align-items-center"
+                style={{ color: TOKENS.ink }}
+              >
+                <Sparkles
+                  size={16}
+                  className="me-2"
+                  color={modeloActivo.color}
+                />
+                Proyección {diasCurva} días — {getNombreProducto()}
+              </h6>
+              {curvaMeta && (
+                <Badge bg="light" text="dark" className="border">
+                  {curvaMeta.metodologia}
+                </Badge>
+              )}
+            </div>
+            <p className="text-muted small mb-3">
+              A diferencia del resultado puntual de arriba, esta curva se
+              construye día a día con el modelo h=1, calibrando su trayectoria
+              contra los modelos h=7 y h=30 en esos puntos exactos.
+            </p>
+
+            <Alert
+              variant="warning"
+              className="border-0 shadow-sm rounded-3 d-flex gap-3 align-items-start mb-3"
+              style={{ backgroundColor: "#FFF9E6", color: TOKENS.ink }}
+            >
+              <AlertTriangle className="mt-1" size={18} color={TOKENS.amber} />
+              <div className="small">
+                <strong>¿Cómo leer esta curva?</strong> Los puntos grandes (días
+                1, 7 y 30) usan un modelo LSTM entrenado específicamente para
+                ese horizonte. Los días intermedios son una proyección calibrada
+                entre esos puntos, no predicciones independientes con el mismo
+                nivel de certeza.
+              </div>
+            </Alert>
+
+            <div style={{ width: "100%", height: 320 }}>
+              <ResponsiveContainer>
+                <ComposedChart
+                  data={curvaData}
+                  margin={{ top: 10, right: 20, left: 10, bottom: 0 }}
+                >
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    vertical={false}
+                    stroke="#e2dfda"
+                  />
+                  <XAxis
+                    dataKey="dia"
+                    tick={{ fontSize: 11, fill: TOKENS.inkMuted }}
+                    label={{
+                      value: "Día",
+                      position: "insideBottom",
+                      offset: -2,
+                      fontSize: 11,
+                    }}
+                  />
+                  <YAxis
+                    tickFormatter={(v) => `$${(v / 1000).toFixed(1)}k`}
+                    tick={{ fontSize: 11, fill: TOKENS.inkMuted }}
+                    width={55}
+                  />
+                  <Tooltip
+                    formatter={(value) => [
+                      `$${Math.round(value).toLocaleString("es-CO")}`,
+                      "Precio Predicho",
+                    ]}
+                    labelFormatter={(label, payload) =>
+                      payload && payload[0]
+                        ? `Día ${label} — ${payload[0].payload.fecha}`
+                        : `Día ${label}`
+                    }
+                    contentStyle={{
+                      borderRadius: 8,
+                      border: `1px solid ${TOKENS.hairline}`,
+                    }}
+                  />
+                  <Legend iconType="circle" />
+                  <Line
+                    type="monotone"
+                    dataKey="precio_predicho_COP_kg"
+                    name="Precio Proyectado"
+                    stroke={modeloActivo.color}
+                    strokeWidth={2.5}
+                    dot={<CurvaDot color={modeloActivo.color} />}
+                    activeDot={{ r: 7 }}
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="d-flex gap-3 mt-3 small text-muted flex-wrap">
+              <span className="d-flex align-items-center gap-1">
+                <span
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    backgroundColor: TOKENS.primaryDark,
+                    display: "inline-block",
+                  }}
+                />
+                Día con modelo dedicado (1, 7, 30)
+              </span>
+              <span className="d-flex align-items-center gap-1">
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: "50%",
+                    backgroundColor: modeloActivo.color,
+                    display: "inline-block",
+                  }}
+                />
+                Día interpolado
+              </span>
+            </div>
+          </Card>
+        )}
+
+        {loadingCurva && (
+          <div className="text-center py-4 mt-3 border rounded-3 bg-white">
+            <Spinner animation="border" variant="success" className="mb-2" />
+            <p className="text-muted mb-0">
+              Ejecutando {diasCurva} predicciones recursivas en el motor LSTM...
+              <br />
+              <small>Esto puede tardar unos segundos.</small>
+            </p>
+          </div>
+        )}
+
         {/* 🆕 TRAÍDO DE CÓDIGO 2: Estado vacío antes de simular */}
         {!data && !loading && !error && (
           <div
@@ -1150,7 +1434,7 @@ const PredictionPanel = () => {
             </div>
             <div style={{ fontSize: 13, color: TOKENS.inkMuted }}>
               Ajusta las variables del entorno arriba y presiona "Simular
-              Precio" para ver el resultado.
+              Precio" o "Ver Proyección Diaria" para ver el resultado.
             </div>
           </div>
         )}
