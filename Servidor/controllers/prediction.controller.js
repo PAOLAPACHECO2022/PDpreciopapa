@@ -27,7 +27,7 @@ exports.getPrediction = async (req, res) => {
     // Pasamos TODO el bloque de parámetros que capturamos del agricultor
     // Asegurar que use la URL correcta concatenada
     const pythonResponse = await axios.get(
-      `${process.env.FASTAPI_URL || "http://localhost:8000/predict"}`,
+      `${process.env.FASTAPI_URL || "http://localhost:8000"}/predict`,
       {
         params: {
           producto,
