@@ -172,7 +172,7 @@ export const MODELOS = {
 // se necesitan para diagnóstico o para reactivarlos más adelante.
 // ─────────────────────────────────────────────────────────────────────────
 export const HORIZONTES_DISPONIBLES = {
-  papa_negra: [1, 7, 30],
+  papa_negra: [1, 7],
   papa_amarilla_BOGOTA: [1],
   papa_amarilla_TUNJA: [1],
 };
