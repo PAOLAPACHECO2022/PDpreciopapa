@@ -172,7 +172,7 @@ export const MODELOS = {
 // se necesitan para diagnóstico o para reactivarlos más adelante.
 // ─────────────────────────────────────────────────────────────────────────
 export const HORIZONTES_DISPONIBLES = {
-  papa_negra: [1, 7],
+  papa_negra: [1, 7, 30],
   papa_amarilla_BOGOTA: [1],
   papa_amarilla_TUNJA: [1],
 };
@@ -1686,10 +1686,16 @@ const PredictionPanel = () => {
               </Col>
             </Row>
 
-            {/* 🆕 TRAÍDO DE CÓDIGO 2: Brújula del Escenario (Radar) */}
-            <Row className="mt-4">
-              <Col xs={12}>
-                <Card className="border-0 shadow-sm bg-white p-4 rounded-4">
+            {/* 🔧 v7.14: Brújula del Escenario y Margen de Ganancia ahora
+                comparten una sola fila responsiva, con el mismo patrón de
+                columnas (7/5) que usan "Canal Analytics" y "Ficha Técnica
+                del Modelo" más arriba. Si el modelo activo no usa
+                abastecimiento/costo (Margen no se muestra), la Brújula pasa
+                a ocupar el ancho completo automáticamente. En pantallas
+                chico (xs/md) cada tarjeta cae a ancho completo apilada. */}
+            <Row className="mt-4 g-4">
+              <Col xs={12} lg={usaAbastecimientoCosto ? 7 : 12}>
+                <Card className="border-0 shadow-sm bg-white p-4 rounded-4 h-100">
                   <h6
                     className="fw-bold mb-1 d-flex align-items-center"
                     style={{ color: TOKENS.ink }}
@@ -1707,14 +1713,13 @@ const PredictionPanel = () => {
                   <ScenarioRadar ejes={radarEjes} color={TOKENS.primary} />
                 </Card>
               </Col>
-            </Row>
 
-            {/* 🔧 v7.13: Se eliminó el Velocímetro de Precisión. Solo queda
-                la Dona de Margen, a ancho completo, cuando el modelo activo
-                usa abastecimiento/costo como variable exógena. */}
-            {usaAbastecimientoCosto && (
-              <Row className="mt-4 g-4">
-                <Col xs={12}>
+              {/* 🔧 Se eliminó el Velocímetro de Precisión. La Dona de
+                  Margen ahora acompaña a la Brújula en la misma fila,
+                  solo cuando el modelo activo usa abastecimiento/costo
+                  como variable exógena. */}
+              {usaAbastecimientoCosto && (
+                <Col xs={12} lg={5}>
                   <Card className="border-0 shadow-sm bg-white p-4 rounded-4 h-100">
                     <h6
                       className="fw-bold mb-1 d-flex align-items-center"
@@ -1734,8 +1739,8 @@ const PredictionPanel = () => {
                     />
                   </Card>
                 </Col>
-              </Row>
-            )}
+              )}
+            </Row>
 
             {/* Alertas e Interpretación Comercial */}
             <div className="mt-4">
