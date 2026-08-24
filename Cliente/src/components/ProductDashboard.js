@@ -27,8 +27,6 @@ import {
   PolarAngleAxis,
   PolarRadiusAxis,
   Radar,
-  RadialBarChart,
-  RadialBar,
   PieChart,
   Pie,
   Cell,
@@ -40,7 +38,6 @@ import {
   Activity,
   Compass,
   ScanLine,
-  Gauge,
   PiggyBank,
   Sparkles,
   AlertTriangle,
@@ -160,11 +157,24 @@ export const MODELOS = {
 // exógenas activa el backend para cada combinación producto+horizonte.
 // Debe reflejar 1:1 "features_por_horizonte" / "features" de
 // prediction_service.py (a su vez calcado del script de entrenamiento).
+//
+// 🔧 v7.13: Restringido a lo que el FRONT permite seleccionar, según las
+// métricas reales de validación de cada modelo (MAE / RMSE / MAPE / R²):
+//
+//   papa_negra            h=1  R²=0.68   h=7  R²=0.58   h=30 R²=0.42  → OK, se dejan los 3
+//   papa_amarilla_BOGOTA  h=1  R²=0.85   h=7  R²=-0.43  h=30 R²=-0.37 → solo h=1
+//   papa_amarilla_TUNJA   h=1  R²=0.79   h=7  R²=-8.68                → solo h=1
+//
+// R² negativo significa que el modelo predice peor que usar simplemente el
+// promedio histórico, así que esos horizontes se ocultan en el front hasta
+// que haya más datos/variables exógenas para reentrenarlos. El backend
+// (prediction_service.py) NO se modifica: los artefactos siguen ahí por si
+// se necesitan para diagnóstico o para reactivarlos más adelante.
 // ─────────────────────────────────────────────────────────────────────────
 export const HORIZONTES_DISPONIBLES = {
   papa_negra: [1, 7, 30],
-  papa_amarilla_BOGOTA: [1, 7, 30],
-  papa_amarilla_TUNJA: [1, 7],
+  papa_amarilla_BOGOTA: [1],
+  papa_amarilla_TUNJA: [1],
 };
 
 export const FEATURES_ACTIVAS = {
@@ -465,80 +475,6 @@ export function ScenarioRadar({ ejes, color }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// NUEVA: Velocímetro de Precisión del Pronóstico (gauge circular)
-// Mide qué tan angosto es el intervalo de confianza respecto al precio
-// predicho: entre más angosto el rango, más "preciso" se considera el
-// pronóstico. Es una métrica heurística de dispersión, no un p-value.
-// ─────────────────────────────────────────────────────────────────────────
-export function ConfidenceGauge({ pct, color }) {
-  const gaugeData = [{ name: "precision", value: pct, fill: color }];
-  const etiqueta = pct >= 75 ? "Alta" : pct >= 45 ? "Media" : "Baja";
-
-  return (
-    <div style={{ position: "relative", width: "100%", height: 220 }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <RadialBarChart
-          cx="50%"
-          cy="52%"
-          innerRadius="72%"
-          outerRadius="100%"
-          barSize={16}
-          startAngle={210}
-          endAngle={-30}
-          data={gaugeData}
-        >
-          <PolarAngleAxis
-            type="number"
-            domain={[0, 100]}
-            angleAxisId={0}
-            tick={false}
-          />
-          <RadialBar
-            background={{ fill: TOKENS.surfaceAlt }}
-            dataKey="value"
-            cornerRadius={10}
-            angleAxisId={0}
-          />
-        </RadialBarChart>
-      </ResponsiveContainer>
-      <div
-        style={{
-          position: "absolute",
-          top: "48%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          textAlign: "center",
-          pointerEvents: "none",
-        }}
-      >
-        <div
-          style={{
-            fontFamily: "IBM Plex Mono",
-            fontSize: 30,
-            fontWeight: 700,
-            color: TOKENS.ink,
-            lineHeight: 1,
-          }}
-        >
-          {Math.round(pct)}%
-        </div>
-        <div
-          style={{
-            fontSize: 11.5,
-            fontWeight: 700,
-            color: color,
-            marginTop: 4,
-            letterSpacing: "0.03em",
-          }}
-        >
-          PRECISIÓN {etiqueta.toUpperCase()}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // NUEVA: Dona de Margen de Ganancia (Costo vs Utilidad estimada)
 // Solo tiene sentido para escenarios donde el modelo usa costo_total como
 // variable exógena (Papa Amarilla en cualquier horizonte, y Papa Negra
@@ -720,7 +656,7 @@ const PredictionPanel = () => {
     setProducto(nuevoProducto);
     const disponibles = HORIZONTES_DISPONIBLES[nuevoProducto] || [1, 7];
     // Si el horizonte actual no existe para el nuevo producto (p.ej. veníamos
-    // de h=30 y cambiamos a Tunja, que solo tiene 1 y 7), lo reseteamos.
+    // de h=30 y cambiamos a un producto que solo tiene h=1), lo reseteamos.
     if (!disponibles.includes(horizonte)) {
       setHorizonte(disponibles[0]);
     }
@@ -931,27 +867,6 @@ const PredictionPanel = () => {
     usaAbastecimientoCosto,
     usaLluvia,
   ]);
-
-  // 🔧 v7.12: Precisión del pronóstico: entre más angosto el IC 95% respecto
-  // al precio predicho, más "preciso" (0-100%). Es heurístico, no un valor
-  // estadístico formal. Se agregó una guarda contra `pred <= 0` (o no
-  // finito): antes, un precio predicho negativo o inválido producía
-  // `spreadPct` negativo, que al hacer `100 - spreadPct` se disparaba por
-  // encima de 100 y el clamp lo dejaba en 100 — mostrando "PRECISIÓN ALTA"
-  // justo en el caso en que la predicción es más sospechosa. Ahora ese
-  // escenario cae directo a 0% ("Baja").
-  const precisionPct = useMemo(() => {
-    if (!data || !data.precio_predicho_COP_kg) return 0;
-    const pred = data.precio_predicho_COP_kg;
-    if (!Number.isFinite(pred) || pred <= 0) return 0;
-
-    const inf = data.IC_inferior_95 ?? pred;
-    const sup = data.IC_superior_95 ?? pred;
-    if (!Number.isFinite(inf) || !Number.isFinite(sup)) return 0;
-
-    const spreadPct = (Math.abs(sup - inf) / pred) * 100;
-    return Math.max(0, Math.min(100, 100 - spreadPct));
-  }, [data]);
 
   const brandStyles = {
     title: {
@@ -1794,33 +1709,12 @@ const PredictionPanel = () => {
               </Col>
             </Row>
 
-            {/* 🆕 TRAÍDO/EXTENDIDO: Velocímetro de Precisión + Dona de Margen */}
-            <Row className="mt-4 g-4">
-              <Col xs={12} lg={usaAbastecimientoCosto ? 6 : 12}>
-                <Card className="border-0 shadow-sm bg-white p-4 rounded-4 h-100">
-                  <h6
-                    className="fw-bold mb-1 d-flex align-items-center"
-                    style={{ color: TOKENS.ink }}
-                  >
-                    <Gauge size={16} className="me-2" /> Velocímetro de
-                    Precisión
-                  </h6>
-                  <p className="text-muted small mb-2">
-                    Mide qué tan angosto es el intervalo de confianza (95%)
-                    frente al precio predicho: entre más angosto, más preciso se
-                    considera el pronóstico.
-                  </p>
-                  <ConfidenceGauge
-                    pct={precisionPct}
-                    color={modeloActivo.color}
-                  />
-                </Card>
-              </Col>
-
-              {/* 🔧 Antes solo aparecía con esAmarilla. Ahora también aparece
-                  para papa_negra@h=30, que activa costo_total. */}
-              {usaAbastecimientoCosto && (
-                <Col xs={12} lg={6}>
+            {/* 🔧 v7.13: Se eliminó el Velocímetro de Precisión. Solo queda
+                la Dona de Margen, a ancho completo, cuando el modelo activo
+                usa abastecimiento/costo como variable exógena. */}
+            {usaAbastecimientoCosto && (
+              <Row className="mt-4 g-4">
+                <Col xs={12}>
                   <Card className="border-0 shadow-sm bg-white p-4 rounded-4 h-100">
                     <h6
                       className="fw-bold mb-1 d-flex align-items-center"
@@ -1840,8 +1734,8 @@ const PredictionPanel = () => {
                     />
                   </Card>
                 </Col>
-              )}
-            </Row>
+              </Row>
+            )}
 
             {/* Alertas e Interpretación Comercial */}
             <div className="mt-4">
