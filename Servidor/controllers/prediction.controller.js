@@ -2,20 +2,6 @@ const axios = require("axios");
 const { correrBatchDiario } = require("../jobs/predictionJob");
 const Prediction = require("../models/Prediction");
 
-// ─────────────────────────────────────────────────────────────────────────
-// 🆕 Horizontes habilitados por producto — DEBE COINCIDIR EXACTAMENTE con
-// HORIZONTES_DISPONIBLES del frontend (PredictionPanel.jsx). Antes esta
-// restricción solo existía en el <Form.Select> de React: un cliente que
-// llamara /api/agro-predictions directamente (Postman, script, URL armada
-// a mano) podía pedir, por ejemplo, papa_amarilla_TUNJA con horizonte=7 y
-// el backend se lo entregaba sin objeción — un modelo con R²=-11.56,
-// peor que predecir el promedio histórico. Esta validación cierra ese hueco
-// a nivel de API, no solo de interfaz.
-//
-// Papa Negra se deja habilitada en los 3 horizontes porque es el único
-// segmento con R² positivo en los tres (0.69 / 0.60 / 0.47) — ver Tabla de
-// métricas M3, sección 3.1 del documento de grado.
-// ─────────────────────────────────────────────────────────────────────────
 const HORIZONTES_DISPONIBLES = {
   papa_negra: [1, 7, 30],
   papa_amarilla_BOGOTA: [1],
