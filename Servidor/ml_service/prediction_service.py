@@ -18,8 +18,8 @@ warnings.filterwarnings("ignore")
 
 app = FastAPI(
     title="Agro Inferencia API",
-    description="Motor predictivo optimizado basado en redes recurrentes LSTM v7.12 para precios agrícolas",
-    version="7.12"
+    description="Motor predictivo optimizado basado en redes recurrentes LSTM v7.13 para precios agrícolas",
+    version="7.13"
 )
 
 app.add_middleware(
@@ -40,6 +40,27 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "model_artifacts")
 
 HORIZONTES_VALIDOS = [1, 7, 30]
+
+# ─────────────────────────────────────────────────────────────────────────
+# 🆕 v7.13: Horizontes habilitados por producto, según el R² real de
+# validación (Tabla de métricas M3, sección 3.1 del documento de grado).
+# DEBE COINCIDIR EXACTAMENTE con HORIZONTES_DISPONIBLES del frontend
+# (PredictionPanel.jsx) y con prediction.controller.js (Node).
+#
+#   papa_negra            h=1 R²=0.69   h=7 R²=0.60   h=30 R²=0.47  → los 3
+#   papa_amarilla_BOGOTA  h=1 R²=0.86   h=7 R²=-0.38  h=30 R²=-0.96 → solo h=1
+#   papa_amarilla_TUNJA   h=1 R²=0.80   h=7 R²=-11.56               → solo h=1
+#
+# Los artefactos (.keras) de los horizontes excluidos NO se borran del
+# servidor —se conservan para diagnóstico o para una eventual reactivación
+# si el reentrenamiento con más datos mejora su desempeño—, pero esta API
+# ya no los usa para servir predicciones ni para calibrar la curva diaria.
+# ─────────────────────────────────────────────────────────────────────────
+HORIZONTES_HABILITADOS_POR_PRODUCTO = {
+    "papa_negra": [1, 7, 30],
+    "papa_amarilla_BOGOTA": [1],
+    "papa_amarilla_TUNJA": [1],
+}
 
 N_BOOTSTRAP = 15
 RUIDO_FRAC_STD = 0.01  # 1% de la desviación histórica de cada variable cruda
@@ -274,10 +295,27 @@ def ejecutar_inferencia(
             status_code=400,
             detail=f"Horizonte inválido. Solo se admite {HORIZONTES_VALIDOS}."
         )
-        
+
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
     if not cfg:
         raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
+
+    # 🆕 v7.13: además de ser un horizonte "válido" en general (1/7/30),
+    # debe estar HABILITADO para este producto específico. Antes esta capa
+    # de defensa solo existía en Node (prediction.controller.js); se agrega
+    # aquí también para que la API no dependa exclusivamente de que Node
+    # sea quien la llame — cualquier cliente que golpee este puerto
+    # directamente queda protegido igual.
+    habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [])
+    if horizonte not in habilitados:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"El horizonte h={horizonte} no está habilitado para '{producto}' "
+                f"por desempeño insuficiente del modelo (R² negativo en validación). "
+                f"Horizontes disponibles para este producto: {habilitados}."
+            )
+        )
 
     try:
         # Cargar con caché optimizada
@@ -335,13 +373,24 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     - Forecasting recursivo con el modelo h=1 (predice día a día, alimentando
       cada predicción como insumo para la siguiente).
     - Calibración con los modelos h=7 y h=30 como "anclas": la curva recursiva
-      se corrige para que pase exactamente por esos dos puntos, ya que esos
-      modelos fueron entrenados específicamente para esos horizontes.
+      se corrige para que pase exactamente por esos dos puntos, ÚNICAMENTE
+      cuando esos horizontes están habilitados para el producto (ver
+      HORIZONTES_HABILITADOS_POR_PRODUCTO).
 
-    LIMITACIÓN IMPORTANTE: las variables exógenas (clima, costos, toneladas)
-    se mantienen constantes en su último valor conocido durante toda la
-    recursión, porque no existe un pronóstico real de esas variables a
-    futuro. Esto es una aproximación, no una predicción certera día a día.
+    🆕 v7.13: antes esta función intentaba cargar y usar los modelos h=7 y
+    h=30 para CUALQUIER producto, sin importar su desempeño de validación.
+    Para papa_amarilla_BOGOTA (R²=-0.38 en h=7, R²=-0.96 en h=30) y
+    papa_amarilla_TUNJA (R²=-11.56 en h=7), esto significaba calibrar la
+    curva diaria contra un modelo que predice peor que el promedio
+    histórico. Ahora, si un ancla no está habilitada para el producto, se
+    omite directamente (ni se carga ni se predice con ella) y la curva
+    para ese tramo queda puramente recursiva (h=1), sin calibración externa.
+
+    LIMITACIÓN IMPORTANTE (sigue vigente): las variables exógenas (clima,
+    costos, toneladas) se mantienen constantes en su último valor conocido
+    durante toda la recursión, porque no existe un pronóstico real de esas
+    variables a futuro. Esto es una aproximación, no una predicción certera
+    día a día.
     """
     model_h1, sf_h1, st_h1 = cargar_artefactos_con_cache(producto, 1)
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
@@ -405,8 +454,16 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
         raise ValueError("No fue posible generar la curva diaria: histórico insuficiente.")
 
     # ── Calibración con anclas h=7 y h=30 ───────────────────────────────
+    # 🆕 v7.13: solo se intenta cargar/predecir con un h_ancla si está
+    # habilitado para este producto. Antes el chequeo era únicamente
+    # "if h_ancla <= len(curva_recursiva)", sin mirar desempeño de validación.
+    horizontes_habilitados_producto = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
     anclas = {}
+    anclas_omitidas_por_desempeno = []
     for h_ancla in [7, 30]:
+        if h_ancla not in horizontes_habilitados_producto:
+            anclas_omitidas_por_desempeno.append(h_ancla)
+            continue  # este horizonte tiene R² negativo para este producto: no se usa como ancla
         if h_ancla <= len(curva_recursiva):
             try:
                 model_h, sf_h, st_h = cargar_artefactos_con_cache(producto, h_ancla)
@@ -420,6 +477,9 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     # Distribuimos la corrección (diferencia entre curva recursiva y ancla)
     # de forma lineal entre los tramos [0, 7] y [7, 30], para que la curva
     # pase exactamente por los puntos confiables sin saltos bruscos.
+    # Si un ancla no está habilitada (o no se pudo calcular), anclas.get(...)
+    # cae al propio valor recursivo, y el residual correspondiente da 0 —
+    # es decir, ese tramo queda puramente recursivo, sin calibración externa.
     residual_7 = anclas.get(7, curva_recursiva[6]["precio_recursivo"]) - curva_recursiva[6]["precio_recursivo"] if len(curva_recursiva) >= 7 else 0
     residual_30 = anclas.get(30, curva_recursiva[-1]["precio_recursivo"]) - curva_recursiva[-1]["precio_recursivo"] if len(curva_recursiva) >= 30 else residual_7
 
@@ -481,11 +541,22 @@ def ejecutar_curva_diaria(
 
         curva = generar_curva_diaria(producto, df_reciente, precio_actual_base, dias=dias)
 
+        # 🆕 v7.13: informamos en la respuesta si la curva quedó puramente
+        # recursiva (sin anclas h=7/h=30) por desempeño insuficiente, para
+        # que el frontend pueda, si quiere, mostrar un aviso adicional.
+        habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
+        anclas_disponibles = [h for h in [7, 30] if h in habilitados]
+
         return {
             "status": "success",
             "modelo_key": producto,
             "dias_generados": len(curva),
-            "metodologia": "Recursivo h=1 calibrado con anclas h=7/h=30",
+            "metodologia": (
+                "Recursivo h=1 calibrado con anclas h=7/h=30"
+                if anclas_disponibles
+                else "Recursivo h=1 puro (sin anclas: h=7/h=30 no habilitados para este producto)"
+            ),
+            "anclas_utilizadas": anclas_disponibles,
             "curva": curva,
         }
 
