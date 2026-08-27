@@ -2,6 +2,32 @@ const axios = require("axios");
 const { correrBatchDiario } = require("../jobs/predictionJob");
 const Prediction = require("../models/Prediction");
 
+// ─────────────────────────────────────────────────────────────────────────
+// 🆕 Horizontes habilitados por producto — DEBE COINCIDIR EXACTAMENTE con
+// HORIZONTES_DISPONIBLES del frontend (PredictionPanel.jsx). Antes esta
+// restricción solo existía en el <Form.Select> de React: un cliente que
+// llamara /api/agro-predictions directamente (Postman, script, URL armada
+// a mano) podía pedir, por ejemplo, papa_amarilla_TUNJA con horizonte=7 y
+// el backend se lo entregaba sin objeción — un modelo con R²=-11.56,
+// peor que predecir el promedio histórico. Esta validación cierra ese hueco
+// a nivel de API, no solo de interfaz.
+//
+// Papa Negra se deja habilitada en los 3 horizontes porque es el único
+// segmento con R² positivo en los tres (0.69 / 0.60 / 0.47) — ver Tabla de
+// métricas M3, sección 3.1 del documento de grado.
+// ─────────────────────────────────────────────────────────────────────────
+const HORIZONTES_DISPONIBLES = {
+  papa_negra: [1, 7, 30],
+  papa_amarilla_BOGOTA: [1],
+  papa_amarilla_TUNJA: [1],
+};
+
+function horizonteHabilitado(producto, horizonte) {
+  const habilitados = HORIZONTES_DISPONIBLES[producto];
+  if (!habilitados) return false; // producto no reconocido
+  return habilitados.includes(Number(horizonte));
+}
+
 // Controlador para gestionar las consultas al modelo predictivo con variables exógenas
 exports.getPrediction = async (req, res) => {
   try {
@@ -23,7 +49,24 @@ exports.getPrediction = async (req, res) => {
       });
     }
 
-    // 2. Comunicarse con el microservicio de FastAPI (Puerto 8000)
+    // 🆕 2. Validar que la combinación producto + horizonte esté habilitada
+    // (mismo criterio que el frontend, pero exigido también en el backend).
+    if (!HORIZONTES_DISPONIBLES[producto]) {
+      return res.status(400).json({
+        message: `Producto no reconocido: '${producto}'.`,
+      });
+    }
+
+    if (!horizonteHabilitado(producto, horizonte)) {
+      return res.status(400).json({
+        message:
+          `El horizonte h=${horizonte} no está habilitado para '${producto}' ` +
+          `por desempeño insuficiente del modelo (R² negativo en validación). ` +
+          `Horizontes disponibles para este producto: ${HORIZONTES_DISPONIBLES[producto].join(", ")}.`,
+      });
+    }
+
+    // 3. Comunicarse con el microservicio de FastAPI (Puerto 8000)
     // Pasamos TODO el bloque de parámetros que capturamos del agricultor
     // Asegurar que use la URL correcta concatenada
     const pythonResponse = await axios.get(
@@ -43,7 +86,7 @@ exports.getPrediction = async (req, res) => {
         },
       },
     );
-    // 3. Retornar las predicciones del modelo LSTM formateadas al cliente React
+    // 4. Retornar las predicciones del modelo LSTM formateadas al cliente React
     return res.status(200).json(pythonResponse.data);
   } catch (error) {
     console.error(
@@ -73,7 +116,7 @@ exports.getPredictionsHistory = async (req, res) => {
       query.horizonte_dias = Number(horizonte);
     }
 
-    // 🆕 Filtro por fecha de predicción (el día que se proyecta el precio,
+    // Filtro por fecha de predicción (el día que se proyecta el precio,
     // no el día en que se ejecutó el job). El input type="date" del front
     // manda un string "YYYY-MM-DD", así que armamos un rango de ese día
     // completo (00:00:00 a 23:59:59) para no depender de la hora exacta
@@ -139,6 +182,17 @@ exports.getPredictionCurve = async (req, res) => {
 
     if (!producto) {
       return res.status(400).json({ message: "Falta el parámetro requerido: producto." });
+    }
+
+    // 🆕 Igual que en getPrediction: validar que el producto exista en el
+    // mapa de horizontes habilitados. La curva diaria en sí siempre parte
+    // de h=1 (que está habilitado para los tres productos), así que aquí
+    // solo validamos que el producto sea reconocido, no un horizonte
+    // puntual. Ver nota importante más abajo sobre las anclas h=7/h=30.
+    if (!HORIZONTES_DISPONIBLES[producto]) {
+      return res.status(400).json({
+        message: `Producto no reconocido: '${producto}'.`,
+      });
     }
 
     const baseUrl = `${process.env.FASTAPI_URL || "http://localhost:8000"}/predict/curve`;    
