@@ -8,7 +8,7 @@ import {
   Button,
   Spinner,
   Alert,
-  Badge,
+  Badge
 } from "react-bootstrap";
 import {
   ResponsiveContainer,
@@ -19,7 +19,7 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
-  Dot,
+  Dot
 } from "recharts";
 import {
   Calendar,
@@ -29,7 +29,7 @@ import {
   FileSpreadsheet,
   Info,
   Sparkles,
-  X,
+  X
 } from "lucide-react";
 import API from "../axios/axiosConfig";
 
@@ -50,7 +50,7 @@ const PALETA = {
   // Color propio para Papa Criolla (Tunja) — antes no tenía un color de
   // línea dedicado en el gráfico porque todos los productos se mezclaban
   // en una sola serie "Precio Predicho".
-  tunja: "#3E6FD9",
+  tunja: "#3E6FD9"
 };
 
 // Metadatos compartidos entre la tabla (badges) y el gráfico (líneas),
@@ -59,7 +59,7 @@ const PALETA = {
 const PRODUCTO_META = {
   papa_negra: { label: "Papa Negra", color: PALETA.primary },
   papa_amarilla_BOGOTA: { label: "Papa Criolla (Bogotá)", color: PALETA.amber },
-  papa_amarilla_TUNJA: { label: "Papa Criolla (Tunja)", color: PALETA.tunja },
+  papa_amarilla_TUNJA: { label: "Papa Criolla (Tunja)", color: PALETA.tunja }
 };
 
 const getMetaProducto = (key) =>
@@ -79,7 +79,7 @@ const getMetaProducto = (key) =>
 const FEATURES_SIMULACION = {
   papa_negra: ["prec30_mm"],
   papa_amarilla_BOGOTA: ["Cant_Ton_Total", "costo_total", "tmedia_c_lag20"],
-  papa_amarilla_TUNJA: ["Cant_Ton_Total", "costo_total", "tmedia_c"],
+  papa_amarilla_TUNJA: ["Cant_Ton_Total", "costo_total", "tmedia_c"]
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -92,7 +92,7 @@ const SIM_DEFAULTS = {
   tmedia_c: 16,
   prec30_mm: 120,
   Cant_Ton_Total: 450,
-  costo_total: 1800,
+  costo_total: 1800
 };
 
 const PredictionHistoryDashboard = () => {
@@ -127,12 +127,12 @@ const PredictionHistoryDashboard = () => {
   const [productoComparacion, setProductoComparacion] = useState("papa_negra");
   const [diasComparacion, setDiasComparacion] = useState(30);
   const [precioPromedioSim, setPrecioPromedioSim] = useState(
-    SIM_DEFAULTS.precio_promedio,
+    SIM_DEFAULTS.precio_promedio
   );
   const [tmediaCSim, setTmediaCSim] = useState(SIM_DEFAULTS.tmedia_c);
   const [prec30MmSim, setPrec30MmSim] = useState(SIM_DEFAULTS.prec30_mm);
   const [cantTonTotalSim, setCantTonTotalSim] = useState(
-    SIM_DEFAULTS.Cant_Ton_Total,
+    SIM_DEFAULTS.Cant_Ton_Total
   );
   const [costoTotalSim, setCostoTotalSim] = useState(SIM_DEFAULTS.costo_total);
 
@@ -140,15 +140,11 @@ const PredictionHistoryDashboard = () => {
   const [errorComparacion, setErrorComparacion] = useState(null);
   const [curvaComparacionData, setCurvaComparacionData] = useState([]);
   const [mostrarComparacion, setMostrarComparacion] = useState(false);
+  const [curvaComparacionMeta, setCurvaComparacionMeta] = useState(null);
 
-  // 🔧 Variables exógenas activas para el producto elegido en el panel de
-  // comparación. Determinan qué sliders se muestran (mismo criterio que
-  // usaTemperatura / usaLluvia / usaAbastecimiento / usaCosto en
-  // PredictionPanel, pero aplicado sobre productoComparacion en vez del
-  // producto/horizonte del simulador puntual).
   const featuresSimulacion = useMemo(
     () => FEATURES_SIMULACION[productoComparacion] || [],
-    [productoComparacion],
+    [productoComparacion]
   );
   const usaTempLagSim = featuresSimulacion.includes("tmedia_c_lag20");
   const usaTempRealSim = featuresSimulacion.includes("tmedia_c");
@@ -191,12 +187,6 @@ const PredictionHistoryDashboard = () => {
       setLoading(false);
     }
   };
-
-  // 🆕 Genera la curva diaria simulada para el producto elegido en el panel
-  // de comparación, reutilizando el mismo endpoint que "Ver Proyección
-  // Diaria" en PredictionPanel. El backend arma internamente el DataFrame
-  // con las 6 columnas y filtra por sí mismo cuáles usa cada horizonte, así
-  // que es seguro enviar siempre el mismo set completo de variables.
   const generarCurvaComparacion = async () => {
     setLoadingComparacion(true);
     setErrorComparacion(null);
@@ -210,12 +200,19 @@ const PredictionHistoryDashboard = () => {
           tmedia_c_lag20: tmediaCSim,
           prec30_mm: prec30MmSim,
           Cant_Ton_Total: cantTonTotalSim,
-          costo_total: costoTotalSim,
-        },
+          costo_total: costoTotalSim
+        }
       });
       if (res.data && res.data.curva) {
         setCurvaComparacionData(res.data.curva);
         setMostrarComparacion(true);
+        // 🆕 v7.15: guardamos el aviso del backend, si vino limitada.
+        setCurvaComparacionMeta({
+          diasGenerados: res.data.dias_generados,
+          diasSolicitados: res.data.dias_solicitados,
+          aviso: res.data.aviso || null,
+          diasLimitados: res.data.dias_limitados_por_falta_de_ancla || false
+        });
       } else {
         setErrorComparacion("El motor LSTM no devolvió una curva válida.");
       }
@@ -223,7 +220,7 @@ const PredictionHistoryDashboard = () => {
       console.error("Error generando la curva de comparación:", err);
       setErrorComparacion(
         err.response?.data?.message ||
-          "No se pudo generar la curva simulada. Verifica que el motor LSTM (Puerto 8000) esté activo.",
+          "No se pudo generar la curva simulada. Verifica que el motor LSTM (Puerto 8000) esté activo."
       );
     } finally {
       setLoadingComparacion(false);
@@ -234,6 +231,7 @@ const PredictionHistoryDashboard = () => {
     setMostrarComparacion(false);
     setCurvaComparacionData([]);
     setErrorComparacion(null);
+    setCurvaComparacionMeta(null);
   };
 
   // Formateadores de datos para el agricultor
@@ -242,7 +240,7 @@ const PredictionHistoryDashboard = () => {
     return new Intl.NumberFormat("es-CO", {
       style: "currency",
       currency: "COP",
-      maximumFractionDigits: 0,
+      maximumFractionDigits: 0
     }).format(valor);
   };
 
@@ -254,7 +252,7 @@ const PredictionHistoryDashboard = () => {
       month: "2-digit",
       year: "numeric",
       hour: "2-digit",
-      minute: "2-digit",
+      minute: "2-digit"
     });
   };
 
@@ -267,7 +265,7 @@ const PredictionHistoryDashboard = () => {
           backgroundColor: `${meta.color}22`,
           color: meta.color,
           border: `1px solid ${meta.color}55`,
-          fontWeight: 700,
+          fontWeight: 700
         }}
       >
         {meta.label}
@@ -283,7 +281,7 @@ const PredictionHistoryDashboard = () => {
       ? historicoData.filter(
           (item) =>
             item.fecha_prediccion &&
-            new Date(item.fecha_prediccion) >= inicioHoy,
+            new Date(item.fecha_prediccion) >= inicioHoy
         )
       : historicoData;
 
@@ -307,19 +305,19 @@ const PredictionHistoryDashboard = () => {
     const rows = historicoOrdenado
       .map(
         (item) =>
-          `"${item._id}","${item.producto}","${item.fecha_ejecucion}","${item.fecha_prediccion}",${item.horizonte_dias},${item.precio_predicho_COP_kg},${item.IC_inferior_95},${item.IC_superior_95}`,
+          `"${item._id}","${item.producto}","${item.fecha_ejecucion}","${item.fecha_prediccion}",${item.horizonte_dias},${item.precio_predicho_COP_kg},${item.IC_inferior_95},${item.IC_superior_95}`
       )
       .join("\n");
 
     const blob = new Blob([headers + rows], {
-      type: "text/csv;charset=utf-8;",
+      type: "text/csv;charset=utf-8;"
     });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
     link.setAttribute(
       "download",
-      `historico_predicciones_${new Date().toISOString().split("T")[0]}.csv`,
+      `historico_predicciones_${new Date().toISOString().split("T")[0]}.csv`
     );
     link.style.visibility = "hidden";
     document.body.appendChild(link);
@@ -327,23 +325,6 @@ const PredictionHistoryDashboard = () => {
     document.body.removeChild(link);
   };
 
-  // ─────────────────────────────────────────────────────────────────────
-  // DATOS DEL GRÁFICO: una serie (línea) POR PRODUCTO, eje X = día
-  // calendario de FECHA PREDICCIÓN, SOLO desde hoy en adelante.
-  //
-  // 🆕 Si hay una curva simulada activa (mostrarComparacion), se fusiona
-  // en el MISMO mapa por día calendario, agregando una serie extra por
-  // producto con la etiqueta "(Simulado)". Así ambas curvas quedan en el
-  // mismo eje X y se pueden comparar visualmente punto a punto.
-  //
-  // Alineación de fechas de la curva simulada: el backend de
-  // /api/prediction-curve devuelve cada punto con "dia" (offset numérico
-  // 1..N desde hoy). En vez de confiar en el formato del campo "fecha" que
-  // devuelva el backend (que puede venir ya formateado para mostrar y no
-  // ser parseable), calculamos la fecha real sumando ese offset a
-  // inicioHoy — así garantizamos que cae exactamente en la misma columna
-  // del eje X que usa la curva histórica.
-  // ─────────────────────────────────────────────────────────────────────
   const { chartData, productosPresentes } = useMemo(() => {
     const mapaPorDia = new Map();
     const productosVistos = new Set();
@@ -361,9 +342,9 @@ const PredictionHistoryDashboard = () => {
         mapaPorDia.set(claveDia, {
           fecha: new Date(`${claveDia}T00:00:00`).toLocaleDateString("es-CO", {
             day: "2-digit",
-            month: "short",
+            month: "short"
           }),
-          _ordenDia: claveDia,
+          _ordenDia: claveDia
         });
       }
 
@@ -381,23 +362,15 @@ const PredictionHistoryDashboard = () => {
     });
 
     const puntosOrdenados = Array.from(mapaPorDia.values()).sort(
-      (a, b) => new Date(a._ordenDia) - new Date(b._ordenDia),
+      (a, b) => new Date(a._ordenDia) - new Date(b._ordenDia)
     );
 
     return {
       chartData: puntosOrdenados,
-      productosPresentes: Array.from(productosVistos),
+      productosPresentes: Array.from(productosVistos)
     };
   }, [historicoData, inicioHoy]);
 
-  // ─────────────────────────────────────────────────────────────────────
-  // 🆕 GRÁFICO DEDICADO DE COMPARACIÓN: a diferencia del gráfico anterior
-  // (que mezcla las 3 variedades y se satura al agregar la simulación),
-  // este solo toma el producto elegido en el panel de comparación y arma
-  // dos series: "Histórico Almacenado" (filtrando historicoData por ese
-  // producto) y "Simulado (LSTM)" (la curva diaria generada). Comparten el
-  // mismo eje X (fecha calendario) que el gráfico principal.
-  // ─────────────────────────────────────────────────────────────────────
   const comparacionChartData = useMemo(() => {
     if (!productoComparacion) return [];
     const mapaPorDia = new Map();
@@ -415,10 +388,10 @@ const PredictionHistoryDashboard = () => {
               "es-CO",
               {
                 day: "2-digit",
-                month: "short",
-              },
+                month: "short"
+              }
             ),
-            _ordenDia: claveDia,
+            _ordenDia: claveDia
           });
         }
 
@@ -447,9 +420,9 @@ const PredictionHistoryDashboard = () => {
           mapaPorDia.set(claveDia, {
             fecha: fechaPunto.toLocaleDateString("es-CO", {
               day: "2-digit",
-              month: "short",
+              month: "short"
             }),
-            _ordenDia: claveDia,
+            _ordenDia: claveDia
           });
         }
 
@@ -460,14 +433,14 @@ const PredictionHistoryDashboard = () => {
     }
 
     return Array.from(mapaPorDia.values()).sort(
-      (a, b) => new Date(a._ordenDia) - new Date(b._ordenDia),
+      (a, b) => new Date(a._ordenDia) - new Date(b._ordenDia)
     );
   }, [
     historicoData,
     inicioHoy,
     productoComparacion,
     mostrarComparacion,
-    curvaComparacionData,
+    curvaComparacionData
   ]);
 
   const hayDatosComparacion =
@@ -501,7 +474,7 @@ const PredictionHistoryDashboard = () => {
         <div
           className="p-4 text-white"
           style={{
-            background: `linear-gradient(135deg, ${PALETA.primaryDark} 0%, #196611 100%)`,
+            background: `linear-gradient(135deg, ${PALETA.primaryDark} 0%, #196611 100%)`
           }}
         >
           <div className="d-flex justify-content-between align-items-center flex-wrap gap-3">
@@ -703,7 +676,7 @@ const PredictionHistoryDashboard = () => {
                         contentStyle={{
                           borderRadius: 8,
                           border: `1px solid ${PALETA.hairline}`,
-                          fontSize: 12,
+                          fontSize: 12
                         }}
                       />
                       <Legend
@@ -796,7 +769,7 @@ const PredictionHistoryDashboard = () => {
                         className="text-end text-muted"
                         style={{
                           fontFamily: "IBM Plex Mono",
-                          fontSize: "12.5px",
+                          fontSize: "12.5px"
                         }}
                       >
                         <span className="text-danger">
@@ -814,20 +787,13 @@ const PredictionHistoryDashboard = () => {
             </div>
           )}
 
-          {/* ─────────────────────────────────────────────────────────────
-              🆕 PANEL DE COMPARACIÓN: al final de todo, para no revolver
-              los filtros/tabla principal con el simulador. Genera la curva
-              diaria simulada (misma lógica que "Ver Proyección Diaria" de
-              PredictionPanel) para compararla contra la curva histórica
-              almacenada de un solo producto.
-             ───────────────────────────────────────────────────────────── */}
           <hr className="my-4" style={{ borderColor: PALETA.hairline }} />
 
           <Card
             className="border-0 shadow-sm p-3 mb-4 rounded-4"
             style={{
               backgroundColor: "#fdfdfb",
-              border: `1px solid ${PALETA.hairline}`,
+              border: `1px solid ${PALETA.hairline}`
             }}
           >
             <h6
@@ -1000,9 +966,7 @@ const PredictionHistoryDashboard = () => {
                     max={4000}
                     step={50}
                     value={costoTotalSim}
-                    onChange={(e) =>
-                      setCostoTotalSim(parseInt(e.target.value))
-                    }
+                    onChange={(e) => setCostoTotalSim(parseInt(e.target.value))}
                   />
                 </Col>
               )}
@@ -1020,13 +984,27 @@ const PredictionHistoryDashboard = () => {
                 className="rounded-3 mt-3 mb-0 small border-0"
                 style={{
                   backgroundColor: PALETA.primarySoft,
-                  color: PALETA.ink,
+                  color: PALETA.ink
                 }}
               >
                 Comparando{" "}
                 <strong>{getMetaProducto(productoComparacion).label}</strong> —
                 curva simulada superpuesta (línea punteada) sobre el histórico
                 almacenado en el gráfico de abajo.
+              </Alert>
+            )}
+
+            {mostrarComparacion && curvaComparacionMeta?.diasLimitados && (
+              <Alert
+                variant="warning"
+                className="rounded-3 mt-2 mb-0 small border-0"
+                style={{ backgroundColor: PALETA.amberSoft, color: PALETA.ink }}
+              >
+                <strong>
+                  Simulación limitada a {curvaComparacionMeta.diasGenerados} de{" "}
+                  {curvaComparacionMeta.diasSolicitados} días solicitados.
+                </strong>{" "}
+                {curvaComparacionMeta.aviso}
               </Alert>
             )}
           </Card>
@@ -1040,6 +1018,20 @@ const PredictionHistoryDashboard = () => {
                 <Sparkles size={16} color={PALETA.primaryDark} />
                 Comparación Individual —{" "}
                 {getMetaProducto(productoComparacion).label}
+                {curvaComparacionMeta?.diasLimitados && (
+                  <Badge
+                    bg={null}
+                    style={{
+                      backgroundColor: `${PALETA.risk}22`,
+                      color: PALETA.risk,
+                      border: `1px solid ${PALETA.risk}55`,
+                      fontWeight: 700
+                    }}
+                  >
+                    Solo {curvaComparacionMeta.diasGenerados} días (sin ancla
+                    h=7/h=30)
+                  </Badge>
+                )}
               </h6>
               <p className="small text-muted mb-3">
                 Vista dedicada a un solo producto: la línea sólida es lo
@@ -1063,7 +1055,7 @@ const PredictionHistoryDashboard = () => {
                       contentStyle={{
                         borderRadius: 8,
                         border: `1px solid ${PALETA.hairline}`,
-                        fontSize: 12,
+                        fontSize: 12
                       }}
                     />
                     <Legend iconType="circle" wrapperStyle={{ fontSize: 12 }} />
@@ -1077,7 +1069,7 @@ const PredictionHistoryDashboard = () => {
                       dot={{
                         r: 4,
                         fill: getMetaProducto(productoComparacion).color,
-                        strokeWidth: 0,
+                        strokeWidth: 0
                       }}
                       activeDot={{ r: 6 }}
                       connectNulls
