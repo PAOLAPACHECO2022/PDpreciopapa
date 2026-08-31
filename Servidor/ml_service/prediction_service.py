@@ -471,6 +471,22 @@ def ejecutar_inferencia(
 # CURVA DIARIA (día 1 a día 30) — Recursivo h=1 calibrado con anclas h=7/h=30
 # ══════════════════════════════════════════════════════════════════════════════
 
+DIAS_MAX_SIN_ANCLA = 7
+
+
+def _volatilidad_diaria_historica(df_reciente: pd.DataFrame) -> float:
+    """
+    Desviación estándar del retorno logarítmico diario, calculada sobre el
+    histórico real recibido (no sobre las predicciones recursivas). Se usa
+    para acotar cada paso de la recursión a un rango de variación
+    fisiológicamente plausible para esta serie, en vez de dejar que el
+    modelo se retroalimente sin ningún límite.
+    """
+    retornos = np.log(df_reciente[TARGET] / df_reciente[TARGET].shift(1)).dropna()
+    vol = float(retornos.std())
+    return vol if np.isfinite(vol) and vol > 0 else 0.05  # 5% como piso defensivo
+
+
 def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual_base: float, dias: int = 30) -> list:
     """
     Genera una curva de precios DIARIOS (día 1 a `dias`) a partir de:
@@ -478,13 +494,23 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     - Calibración con los modelos h=7 y h=30 como "anclas", únicamente
       cuando esos horizontes están habilitados para el producto.
 
+    🆕 v7.15: cada retorno logarítmico diario predicho se acota a
+    ±K_SIGMA_CLAMP desviaciones estándar de la volatilidad diaria histórica
+    real de la serie (calculada sobre datos reales, no sobre predicciones
+    propias). Esto evita que pequeños sesgos del modelo se compongan
+    exponencialmente a lo largo de la recursión — el caso más extremo era
+    Amarilla-Tunja, cuya ventana de 30 días termina compuesta enteramente
+    por predicciones propias (sin ningún dato real dentro de la ventana)
+    y sin ancla h=7/h=30 que corrija el rumbo.
+
     LIMITACIÓN IMPORTANTE (sigue vigente): las variables exógenas (clima,
     costos, toneladas) se mantienen constantes en su último valor real
     conocido durante toda la recursión, porque no existe un pronóstico
     real de esas variables a futuro. Esto es una aproximación, no una
-    predicción certera día a día — pero al menos ahora arranca desde un
-    histórico real, no desde ruido aleatorio.
+    predicción certera día a día.
     """
+    K_SIGMA_CLAMP = 3.0  # bandas de +/-3 desviaciones estándar históricas
+
     model_h1, sf_h1, st_h1 = cargar_artefactos_con_cache(producto, 1)
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
 
@@ -499,12 +525,18 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     feat_idx_h1 = [features.index(f) for f in features_h1]
     ops_agr_h1 = [ops_agr[i] for i in feat_idx_h1]
 
+    # 🆕 v7.15: volatilidad histórica real, calculada UNA vez sobre el
+    # histórico de entrada (antes de empezar a recursar), no se recalcula
+    # sobre datos sintéticos generados por el propio modelo.
+    vol_diaria = _volatilidad_diaria_historica(df_reciente) if usar_diff else None
+
     df_trabajo = df_reciente[features].copy()
 
     ultima_fecha = df_trabajo.index[-1]
     ultima_fila_exogenas = df_trabajo.iloc[-1].copy()  # se mantiene constante
 
     curva_recursiva = []
+    n_dias_clamp_aplicado = 0
 
     for dia in range(1, dias + 1):
         if usar_diff:
@@ -526,6 +558,17 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
             pred_sc = model_h1.predict(X_inf, verbose=0)[0, 0]
 
         pred_inv = st_h1.inverse_transform([[pred_sc]])[0, 0]
+
+        # 🆕 v7.15: acotar el retorno logarítmico diario a +/-K_SIGMA_CLAMP
+        # desviaciones estándar históricas, SOLO aplica a series con
+        # DIFERENCIAR=True (donde el "runaway" multiplicativo es posible).
+        if usar_diff and vol_diaria is not None:
+            limite = K_SIGMA_CLAMP * vol_diaria
+            pred_inv_clamped = float(np.clip(pred_inv, -limite, limite))
+            if pred_inv_clamped != pred_inv:
+                n_dias_clamp_aplicado += 1
+            pred_inv = pred_inv_clamped
+
         pred_cop = precio_ancla_paso * np.exp(pred_inv) if usar_diff else pred_inv
 
         if not np.isfinite(pred_cop) or pred_cop <= 0:
@@ -576,6 +619,13 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
             "es_ancla": d in (7, 30) and d in anclas,
         })
 
+    # 🆕 v7.15: se adjunta como atributo informal para que el endpoint
+    # pueda reportarlo en la respuesta (no afecta el cálculo en sí).
+    generar_curva_diaria._ultimo_clamp_info = {
+        "dias_con_clamp_aplicado": n_dias_clamp_aplicado,
+        "volatilidad_diaria_usada": round(vol_diaria, 5) if vol_diaria is not None else None,
+    }
+
     return curva_final
 
 
@@ -595,7 +645,16 @@ def ejecutar_curva_diaria(
         raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
 
     try:
-        # 🆕 v7.14: histórico real en vez de simulado
+        # 🆕 v7.15: si el producto no tiene h=7 ni h=30 habilitados, no hay
+        # ningún ancla real que corrija la recursión más allá del día 1 —
+        # se limita la curva a DIAS_MAX_SIN_ANCLA en vez de dejar que se
+        # extrapole 30 días sin ninguna corrección (esto era exactamente
+        # lo que producía el disparo a $21.433 en Amarilla-Tunja).
+        habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
+        tiene_ancla = any(h in habilitados for h in [7, 30])
+        dias_efectivos = dias if tiene_ancla else min(dias, DIAS_MAX_SIN_ANCLA)
+        dias_limitados = dias_efectivos < dias
+
         overrides = {
             "precio_promedio": precio_promedio,
             "tmedia_c": tmedia_c,
@@ -607,21 +666,30 @@ def ejecutar_curva_diaria(
         df_reciente = _construir_df_reciente(producto, min_dias=95, overrides=overrides)
         precio_actual_base = float(df_reciente[TARGET].iloc[-1])
 
-        curva = generar_curva_diaria(producto, df_reciente, precio_actual_base, dias=dias)
+        curva = generar_curva_diaria(producto, df_reciente, precio_actual_base, dias=dias_efectivos)
+        clamp_info = getattr(generar_curva_diaria, "_ultimo_clamp_info", {})
 
-        habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
         anclas_disponibles = [h for h in [7, 30] if h in habilitados]
 
         return {
             "status": "success",
             "modelo_key": producto,
+            "dias_solicitados": dias,
             "dias_generados": len(curva),
             "metodologia": (
                 "Recursivo h=1 calibrado con anclas h=7/h=30"
                 if anclas_disponibles
-                else "Recursivo h=1 puro (sin anclas: h=7/h=30 no habilitados para este producto)"
+                else "Recursivo h=1 puro, acotado por volatilidad histórica (sin anclas: h=7/h=30 no habilitados para este producto)"
             ),
             "anclas_utilizadas": anclas_disponibles,
+            "dias_limitados_por_falta_de_ancla": dias_limitados,
+            "aviso": (
+                f"Este producto solo tiene h=1 validado; la curva se limitó a "
+                f"{DIAS_MAX_SIN_ANCLA} días porque no hay un modelo h=7/h=30 "
+                f"confiable que corrija la proyección más allá de ese punto."
+                if dias_limitados else None
+            ),
+            "clamp_volatilidad": clamp_info,
             "curva": curva,
         }
 
