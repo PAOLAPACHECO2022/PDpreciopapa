@@ -69,16 +69,7 @@ export const TOKENS = {
 export const FONT_IMPORT =
   "@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Sora:wght@600;700&display=swap');";
 
-// ─────────────────────────────────────────────────────────────────────────
-// MODELOS Y METADATOS DE REDES NEURONALES (Ficha Técnica)
-// 🔧 AJUSTE: ventana / escalador / estacionariedad se corrigieron para
-// coincidir exactamente con MODELOS[] del script de entrenamiento
-// (WINDOW_SIZE, SCALER_TYPE, DIFERENCIAR de cada modelo).
-// 🆕 Se agregó "importancia[30]" para papa_negra y papa_amarilla_BOGOTA,
-// que ahora también entrenan el horizonte h=30. Los pesos son estimaciones
-// razonables (no provienen de un PFI real para h=30, que solo se grafica
-// para h=1 en el pipeline); ajústalos si tienes las cifras reales.
-// ─────────────────────────────────────────────────────────────────────────
+
 export const MODELOS = {
   papa_negra: {
     label: "Papa Negra (Estratificada)",
@@ -152,25 +143,6 @@ export const MODELOS = {
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────
-// 🆕 Qué horizontes tiene realmente entrenados cada modelo, y qué variables
-// exógenas activa el backend para cada combinación producto+horizonte.
-// Debe reflejar 1:1 "features_por_horizonte" / "features" de
-// prediction_service.py (a su vez calcado del script de entrenamiento).
-//
-// 🔧 v7.13: Restringido a lo que el FRONT permite seleccionar, según las
-// métricas reales de validación de cada modelo (MAE / RMSE / MAPE / R²):
-//
-//   papa_negra            h=1  R²=0.68   h=7  R²=0.58   h=30 R²=0.42  → OK, se dejan los 3
-//   papa_amarilla_BOGOTA  h=1  R²=0.85   h=7  R²=-0.43  h=30 R²=-0.37 → solo h=1
-//   papa_amarilla_TUNJA   h=1  R²=0.79   h=7  R²=-8.68                → solo h=1
-//
-// R² negativo significa que el modelo predice peor que usar simplemente el
-// promedio histórico, así que esos horizontes se ocultan en el front hasta
-// que haya más datos/variables exógenas para reentrenarlos. El backend
-// (prediction_service.py) NO se modifica: los artefactos siguen ahí por si
-// se necesitan para diagnóstico o para reactivarlos más adelante.
-// ─────────────────────────────────────────────────────────────────────────
 export const HORIZONTES_DISPONIBLES = {
   papa_negra: [1, 7, 30],
   papa_amarilla_BOGOTA: [1],
@@ -309,11 +281,7 @@ export function KpiCard({ label, value, sub, tone, Icon }) {
 }
 
 export function RangeGauge({ floor, mid, ceil, current, color }) {
-  // 🔧 v7.12: guarda contra IC degenerado o inválido. Antes, si
-  // ceil === floor (ancho de IC = 0) la división por (ceil - floor) daba
-  // Infinity/NaN, y si ceil < floor (IC invertido, no debería pasar pero es
-  // defensivo) los porcentajes salían negativos o >100 antes del clamp,
-  // desplazando los marcadores fuera de la barra de forma silenciosa.
+
   const rangoValido =
     typeof floor === "number" &&
     typeof ceil === "number" &&
@@ -397,13 +365,6 @@ export function RangeGauge({ floor, mid, ceil, current, color }) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 🆕 TRAÍDO DE CÓDIGO 2: Brújula del Escenario (gráfica de radar / telaraña)
-// 🔧 AJUSTE: la línea "Condición típica" ahora se dibuja ENCIMA de "Tu
-// escenario" (se invirtió el orden de los <Radar>), con más contraste y
-// puntos en los vértices, para que siga siendo visible incluso cuando tu
-// escenario coincide con la condición típica (valores por defecto).
-// ─────────────────────────────────────────────────────────────────────────
 export function ScenarioRadar({ ejes, color }) {
   return (
     <ResponsiveContainer width="100%" height={280}>
@@ -558,13 +519,6 @@ export function MarginDonut({ costo, precio, color }) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 🆕 NUEVO: Punto personalizado para la curva diaria. Los días con modelo
-// dedicado (1, 7, 30 — marcados por el backend con "es_ancla": true) se
-// dibujan más grandes y sólidos; los días interpolados entre esas anclas
-// se dibujan pequeños, para comunicar visualmente que no tienen el mismo
-// respaldo de precisión.
-// ─────────────────────────────────────────────────────────────────────────
 function CurvaDot(props) {
   const { cx, cy, payload, color } = props;
   if (payload?.es_ancla) {
@@ -635,12 +589,6 @@ const PredictionPanel = () => {
 
   const modeloActivo = MODELOS[producto] || MODELOS.papa_negra;
 
-  // 🔧 CORRECCIÓN CENTRAL: qué variables exógenas están realmente activas
-  // para el par (producto, horizonte) seleccionado, según
-  // FEATURES_ACTIVAS (calcado 1:1 del backend / script de entrenamiento).
-  // Antes esto se decidía con reglas sueltas (esAmarilla, mostrarLluvia,
-  // producto === "papa_negra" && horizonte === 7) que no cubrían h=1 ni
-  // h=30 y mezclaban tmedia_c con tmedia_c_lag20 incorrectamente.
   const featuresActivas = FEATURES_ACTIVAS[producto]?.[horizonte] || [];
   const usaTempLag = featuresActivas.includes("tmedia_c_lag20");
   const usaTempReal = featuresActivas.includes("tmedia_c");
@@ -674,10 +622,7 @@ const PredictionPanel = () => {
       precio_promedio: precioPromedio,
     };
 
-    // 🔧 El backend usa "tmedia_c_lag20" para papa_negra@h7 y para
-    // papa_amarilla_BOGOTA (todos los horizontes), y "tmedia_c" (temperatura
-    // real, sin lag) para papa_negra@h30 y para Tunja. papa_negra@h1 no usa
-    // temperatura en absoluto. featuresActivas ya resuelve esto por nosotros.
+
     if (usaTempLag) paramsPayload.tmedia_c_lag20 = tmediaC;
     if (usaTempReal) paramsPayload.tmedia_c = tmediaC;
     if (usaLluvia) paramsPayload.prec30_mm = prec30Mm;
@@ -742,14 +687,7 @@ const PredictionPanel = () => {
     }
   };
 
-  // 🆕 CURVA DIARIA: reutiliza EXACTAMENTE las mismas variables exógenas del
-  // acordeón (precioPromedio, tmediaC, prec30Mm, cantTonTotal, costoTotal).
-  // No hace falta replicar featuresActivas aquí: el endpoint /predict/curve
-  // ya arma internamente el DataFrame con las 6 columnas y filtra por sí
-  // mismo cuáles usa cada horizonte (h=1 para la recursión, h=7/h=30 como
-  // anclas de calibración). Enviar todos los valores disponibles es seguro
-  // incluso si el horizonte puntual seleccionado arriba no los usa todos.
-  const generarCurvaDiaria = async () => {
+ const generarCurvaDiaria = async () => {
     setLoadingCurva(true);
     setErrorCurva(null);
     setCurvaData([]);
@@ -774,7 +712,12 @@ const PredictionPanel = () => {
         setCurvaData(res.data.curva);
         setCurvaMeta({
           dias_generados: res.data.dias_generados,
+          dias_solicitados: res.data.dias_solicitados,
           metodologia: res.data.metodologia,
+          // 🆕 v7.15: aviso del backend cuando la curva se limitó por falta
+          // de ancla real (h=7/h=30 no habilitados para este producto).
+          aviso: res.data.aviso || null,
+          diasLimitados: res.data.dias_limitados_por_falta_de_ancla || false,
         });
       }
     } catch (err) {
@@ -839,14 +782,7 @@ const PredictionPanel = () => {
         base: normalizar(BASELINE.lluvia, RANGOS.lluvia),
       });
     }
-    // 🆕 Relleno solo si hace falta: un radar con menos de 3 ejes se "aplana"
-    // en una línea (geometría, no bug). Esto ocurre con Papa Negra a 1 día
-    // (únicamente Precio + Lluvia). En esos casos añadimos un tercer eje.
-    // 🔧 IMPORTANTE: este eje NO es una variable continua real del modelo, así
-    // que no tiene sentido compararlo contra una "condición típica" (eso
-    // generaba un pico falso siempre en 100%, sin relación con tu escenario
-    // real). Por eso su "base" es igual a su "valor": no aporta comparación,
-    // solo evita que el polígono se colapse en una línea.
+
     if (ejes.length < 3) {
       const horizonteNorm = normalizar(horizonte, [1, 30]);
       ejes.push({
@@ -1050,14 +986,6 @@ const PredictionPanel = () => {
                     </Form.Group>
                   </Col>
 
-                  {/* 🔧 CORREGIDO: este control estaba mal etiquetado como
-                      "Precipitación Acumulada" pero en realidad manipulaba
-                      la temperatura (rango 5-32, unidad °C, coincide con
-                      RANGOS.temp / BASELINE.temp). Ahora está bien
-                      etiquetado, actualiza el estado correcto (tmediaC) y
-                      solo se muestra cuando el modelo activo realmente usa
-                      temperatura (papa_negra a h=7/h=30, y Papa Amarilla en
-                      cualquier horizonte). */}
                   {usaTemperatura && (
                     <Col xs={12} sm={6} md={4}>
                       <Form.Group>
@@ -1076,9 +1004,7 @@ const PredictionPanel = () => {
                     </Col>
                   )}
 
-                  {/* 🔧 Antes solo aparecía si producto.includes("papa_amarilla").
-                      Ahora también aparece para papa_negra@h=30, que agregó
-                      Cant_Ton_Total y costo_total como exógenas. */}
+                  
                   {usaAbastecimiento && (
                     <Col xs={12} sm={6} md={4}>
                       <Form.Group>
@@ -1121,10 +1047,7 @@ const PredictionPanel = () => {
                     </Col>
                   )}
 
-                  {/* 🔧 Antes solo se mostraba con horizonte === 7. papa_negra
-                      también usa prec30_mm en h=1 (según
-                      features_por_horizonte del entrenamiento), así que la
-                      condición ahora depende de usaLluvia. */}
+                  
                   {usaLluvia && (
                     <Col xs={12} sm={6} md={4}>
                       <Form.Group>
@@ -1183,7 +1106,7 @@ const PredictionPanel = () => {
           </Alert>
         )}
 
-        {/* 🆕 CURVA DIARIA — resultado */}
+        {/* 🆕 CURVA DIARIA — resultado */}            
         {curvaData.length > 0 && !loadingCurva && (
           <Card className="border-0 shadow-sm bg-white p-4 rounded-4 mt-3">
             <div className="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
@@ -1196,7 +1119,7 @@ const PredictionPanel = () => {
                   className="me-2"
                   color={modeloActivo.color}
                 />
-                Proyección {diasCurva} días — {getNombreProducto()}
+                Proyección {curvaMeta?.dias_generados || diasCurva} días — {getNombreProducto()}
               </h6>
               {curvaMeta && (
                 <Badge bg="light" text="dark" className="border">
@@ -1204,10 +1127,28 @@ const PredictionPanel = () => {
                 </Badge>
               )}
             </div>
+            {curvaMeta?.diasLimitados && curvaMeta?.aviso && (
+              <Alert
+                variant="danger"
+                className="border-0 shadow-sm rounded-3 d-flex gap-3 align-items-start mb-3"
+                style={{ backgroundColor: TOKENS.riskSoft, color: TOKENS.ink }}
+              >
+                <AlertTriangle className="mt-1" size={18} color={TOKENS.risk} />
+                <div className="small">
+                  <strong>
+                    Proyección limitada a {curvaMeta.dias_generados} de {curvaMeta.dias_solicitados} días solicitados.
+                  </strong>{" "}
+                  {curvaMeta.aviso}
+                </div>
+              </Alert>
+            )}
+
             <p className="text-muted small mb-3">
               A diferencia del resultado puntual de arriba, esta curva se
-              construye día a día con el modelo h=1, calibrando su trayectoria
-              contra los modelos h=7 y h=30 en esos puntos exactos.
+              construye día a día con el modelo h=1
+              {curvaMeta?.diasLimitados
+                ? "."
+                : ", calibrando su trayectoria contra los modelos h=7 y h=30 en esos puntos exactos."}
             </p>
 
             <Alert
@@ -1217,11 +1158,10 @@ const PredictionPanel = () => {
             >
               <AlertTriangle className="mt-1" size={18} color={TOKENS.amber} />
               <div className="small">
-                <strong>¿Cómo leer esta curva?</strong> Los puntos grandes (días
-                1, 7 y 30) usan un modelo LSTM entrenado específicamente para
-                ese horizonte. Los días intermedios son una proyección calibrada
-                entre esos puntos, no predicciones independientes con el mismo
-                nivel de certeza.
+                <strong>¿Cómo leer esta curva?</strong>{" "}
+                {curvaMeta?.diasLimitados
+                  ? "El único punto grande (día 1) usa un modelo LSTM entrenado específicamente para ese horizonte. Los días siguientes son una proyección recursiva pura, acotada por la volatilidad histórica de la serie, sin un segundo punto de referencia real que la corrija."
+                  : "Los puntos grandes (días 1, 7 y 30) usan un modelo LSTM entrenado específicamente para ese horizonte. Los días intermedios son una proyección calibrada entre esos puntos, no predicciones independientes con el mismo nivel de certeza."}
               </div>
             </Alert>
 
@@ -1686,13 +1626,6 @@ const PredictionPanel = () => {
               </Col>
             </Row>
 
-            {/* 🔧 v7.14: Brújula del Escenario y Margen de Ganancia ahora
-                comparten una sola fila responsiva, con el mismo patrón de
-                columnas (7/5) que usan "Canal Analytics" y "Ficha Técnica
-                del Modelo" más arriba. Si el modelo activo no usa
-                abastecimiento/costo (Margen no se muestra), la Brújula pasa
-                a ocupar el ancho completo automáticamente. En pantallas
-                chico (xs/md) cada tarjeta cae a ancho completo apilada. */}
             <Row className="mt-4 g-4">
               <Col xs={12} lg={usaAbastecimientoCosto ? 7 : 12}>
                 <Card className="border-0 shadow-sm bg-white p-4 rounded-4 h-100">
