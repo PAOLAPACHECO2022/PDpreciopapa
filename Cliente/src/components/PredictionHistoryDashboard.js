@@ -66,6 +66,23 @@ const getMetaProducto = (key) =>
   PRODUCTO_META[key] || { label: key || "Desconocido", color: PALETA.inkMuted };
 
 // ─────────────────────────────────────────────────────────────────────────
+// 🆕 Qué variables exógenas usa cada producto en el modelo h=1 (el que
+// alimenta la recursión diaria de /api/prediction-curve). Debe reflejar
+// 1:1 FEATURES_ACTIVAS[producto][1] del PredictionPanel /
+// prediction_service.py, para que el panel de comparación de este
+// dashboard solo muestre los sliders que realmente afectan el resultado
+// simulado de cada variedad:
+//   - papa_negra            → Precio + Lluvia
+//   - papa_amarilla_BOGOTA  → Precio + Temp (lag 20d) + Abastecimiento + Costo
+//   - papa_amarilla_TUNJA   → Precio + Temp + Abastecimiento + Costo
+// ─────────────────────────────────────────────────────────────────────────
+const FEATURES_SIMULACION = {
+  papa_negra: ["prec30_mm"],
+  papa_amarilla_BOGOTA: ["Cant_Ton_Total", "costo_total", "tmedia_c_lag20"],
+  papa_amarilla_TUNJA: ["Cant_Ton_Total", "costo_total", "tmedia_c"],
+};
+
+// ─────────────────────────────────────────────────────────────────────────
 // 🆕 Valores por defecto para las variables exógenas del simulador de curva
 // diaria. Son los mismos "BASELINE" usados en PredictionPanel, para que la
 // comparación arranque desde una condición de mercado típica.
@@ -123,6 +140,22 @@ const PredictionHistoryDashboard = () => {
   const [errorComparacion, setErrorComparacion] = useState(null);
   const [curvaComparacionData, setCurvaComparacionData] = useState([]);
   const [mostrarComparacion, setMostrarComparacion] = useState(false);
+
+  // 🔧 Variables exógenas activas para el producto elegido en el panel de
+  // comparación. Determinan qué sliders se muestran (mismo criterio que
+  // usaTemperatura / usaLluvia / usaAbastecimiento / usaCosto en
+  // PredictionPanel, pero aplicado sobre productoComparacion en vez del
+  // producto/horizonte del simulador puntual).
+  const featuresSimulacion = useMemo(
+    () => FEATURES_SIMULACION[productoComparacion] || [],
+    [productoComparacion],
+  );
+  const usaTempLagSim = featuresSimulacion.includes("tmedia_c_lag20");
+  const usaTempRealSim = featuresSimulacion.includes("tmedia_c");
+  const usaTemperaturaSim = usaTempLagSim || usaTempRealSim;
+  const usaLluviaSim = featuresSimulacion.includes("prec30_mm");
+  const usaAbastecimientoSim = featuresSimulacion.includes("Cant_Ton_Total");
+  const usaCostoSim = featuresSimulacion.includes("costo_total");
 
   // Si el usuario cambia el filtro principal de producto de la tabla, lo
   // reflejamos también en el selector de comparación (comodidad: es lo más
@@ -877,7 +910,17 @@ const PredictionHistoryDashboard = () => {
               </Col>
             </Row>
 
-            {/* Variables exógenas del escenario simulado */}
+            {/* 🔧 Variables exógenas del escenario simulado — ahora solo se
+                muestran las que realmente usa el modelo de la variedad
+                seleccionada en productoComparacion (featuresSimulacion),
+                igual que en el acordeón "Configurar Variables del Entorno"
+                de PredictionPanel:
+                  - Papa Negra            → Precio + Lluvia
+                  - Papa Criolla Bogotá   → Precio + Temp(lag20) + Abastecimiento + Costo
+                  - Papa Criolla Tunja    → Precio + Temp + Abastecimiento + Costo
+                Los sliders ocultos conservan su último valor y siguen
+                viajando en el payload de generarCurvaComparacion; el
+                backend simplemente ignora las columnas que no necesita. */}
             <Row className="g-3 mt-1">
               <Col xs={12} sm={6} md={4}>
                 <Form.Label className="small text-muted mb-0">
@@ -896,56 +939,73 @@ const PredictionHistoryDashboard = () => {
                   }
                 />
               </Col>
-              <Col xs={12} sm={6} md={4}>
-                <Form.Label className="small text-muted mb-0">
-                  Temperatura Media: <strong>{tmediaCSim} °C</strong>
-                </Form.Label>
-                <Form.Range
-                  min={5}
-                  max={32}
-                  step={1}
-                  value={tmediaCSim}
-                  onChange={(e) => setTmediaCSim(parseInt(e.target.value))}
-                />
-              </Col>
-              <Col xs={12} sm={6} md={4}>
-                <Form.Label className="small text-muted mb-0">
-                  Precipitación Acum. (30d): <strong>{prec30MmSim} mm</strong>
-                </Form.Label>
-                <Form.Range
-                  min={0}
-                  max={400}
-                  step={5}
-                  value={prec30MmSim}
-                  onChange={(e) => setPrec30MmSim(parseInt(e.target.value))}
-                />
-              </Col>
-              <Col xs={12} sm={6} md={4}>
-                <Form.Label className="small text-muted mb-0">
-                  Abastecimiento en Plaza:{" "}
-                  <strong>{cantTonTotalSim} Ton</strong>
-                </Form.Label>
-                <Form.Range
-                  min={50}
-                  max={1000}
-                  step={10}
-                  value={cantTonTotalSim}
-                  onChange={(e) => setCantTonTotalSim(parseInt(e.target.value))}
-                />
-              </Col>
-              <Col xs={12} sm={6} md={4}>
-                <Form.Label className="small text-muted mb-0">
-                  Costos Totales Insumos:{" "}
-                  <strong>${costoTotalSim.toLocaleString("es-CO")}/kg</strong>
-                </Form.Label>
-                <Form.Range
-                  min={500}
-                  max={4000}
-                  step={50}
-                  value={costoTotalSim}
-                  onChange={(e) => setCostoTotalSim(parseInt(e.target.value))}
-                />
-              </Col>
+
+              {usaTemperaturaSim && (
+                <Col xs={12} sm={6} md={4}>
+                  <Form.Label className="small text-muted mb-0">
+                    Temperatura Media{usaTempLagSim ? " (lag 20d)" : ""}:{" "}
+                    <strong>{tmediaCSim} °C</strong>
+                  </Form.Label>
+                  <Form.Range
+                    min={5}
+                    max={32}
+                    step={1}
+                    value={tmediaCSim}
+                    onChange={(e) => setTmediaCSim(parseInt(e.target.value))}
+                  />
+                </Col>
+              )}
+
+              {usaLluviaSim && (
+                <Col xs={12} sm={6} md={4}>
+                  <Form.Label className="small text-muted mb-0">
+                    Precipitación Acum. (30d): <strong>{prec30MmSim} mm</strong>
+                  </Form.Label>
+                  <Form.Range
+                    min={0}
+                    max={400}
+                    step={5}
+                    value={prec30MmSim}
+                    onChange={(e) => setPrec30MmSim(parseInt(e.target.value))}
+                  />
+                </Col>
+              )}
+
+              {usaAbastecimientoSim && (
+                <Col xs={12} sm={6} md={4}>
+                  <Form.Label className="small text-muted mb-0">
+                    Abastecimiento en Plaza:{" "}
+                    <strong>{cantTonTotalSim} Ton</strong>
+                  </Form.Label>
+                  <Form.Range
+                    min={50}
+                    max={1000}
+                    step={10}
+                    value={cantTonTotalSim}
+                    onChange={(e) =>
+                      setCantTonTotalSim(parseInt(e.target.value))
+                    }
+                  />
+                </Col>
+              )}
+
+              {usaCostoSim && (
+                <Col xs={12} sm={6} md={4}>
+                  <Form.Label className="small text-muted mb-0">
+                    Costos Totales Insumos:{" "}
+                    <strong>${costoTotalSim.toLocaleString("es-CO")}/kg</strong>
+                  </Form.Label>
+                  <Form.Range
+                    min={500}
+                    max={4000}
+                    step={50}
+                    value={costoTotalSim}
+                    onChange={(e) =>
+                      setCostoTotalSim(parseInt(e.target.value))
+                    }
+                  />
+                </Col>
+              )}
             </Row>
 
             {errorComparacion && (
