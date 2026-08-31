@@ -8,18 +8,19 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Silencia advertencias innecesarias d
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import joblib
 import warnings
-import traceback 
+import traceback
 warnings.filterwarnings("ignore")
 
 app = FastAPI(
     title="Agro Inferencia API",
-    description="Motor predictivo optimizado basado en redes recurrentes LSTM v7.13 para precios agrícolas",
-    version="7.13"
+    description="Motor predictivo optimizado basado en redes recurrentes LSTM v7.14 para precios agrícolas",
+    version="7.14"
 )
 
 app.add_middleware(
@@ -35,27 +36,11 @@ app.add_middleware(
 TARGET = "precio_promedio"
 WINDOW_SIZE = 60
 
-# Obtener la ruta absoluta del directorio donde reside este archivo prediction_service.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "model_artifacts")
 
 HORIZONTES_VALIDOS = [1, 7, 30]
 
-# ─────────────────────────────────────────────────────────────────────────
-# 🆕 v7.13: Horizontes habilitados por producto, según el R² real de
-# validación (Tabla de métricas M3, sección 3.1 del documento de grado).
-# DEBE COINCIDIR EXACTAMENTE con HORIZONTES_DISPONIBLES del frontend
-# (PredictionPanel.jsx) y con prediction.controller.js (Node).
-#
-#   papa_negra            h=1 R²=0.69   h=7 R²=0.60   h=30 R²=0.47  → los 3
-#   papa_amarilla_BOGOTA  h=1 R²=0.86   h=7 R²=-0.38  h=30 R²=-0.96 → solo h=1
-#   papa_amarilla_TUNJA   h=1 R²=0.80   h=7 R²=-11.56               → solo h=1
-#
-# Los artefactos (.keras) de los horizontes excluidos NO se borran del
-# servidor —se conservan para diagnóstico o para una eventual reactivación
-# si el reentrenamiento con más datos mejora su desempeño—, pero esta API
-# ya no los usa para servir predicciones ni para calibrar la curva diaria.
-# ─────────────────────────────────────────────────────────────────────────
 HORIZONTES_HABILITADOS_POR_PRODUCTO = {
     "papa_negra": [1, 7, 30],
     "papa_amarilla_BOGOTA": [1],
@@ -64,6 +49,37 @@ HORIZONTES_HABILITADOS_POR_PRODUCTO = {
 
 N_BOOTSTRAP = 15
 RUIDO_FRAC_STD = 0.01  # 1% de la desviación histórica de cada variable cruda
+
+# ─────────────────────────────────────────────────────────────────────────
+# 🆕 v7.14: filtros producto_norm/ciudad_norm — calcados 1:1 de
+# CONFIG_SERIES / MODELOS del notebook de entrenamiento, para que el
+# histórico real que se descarga aquí sea exactamente el mismo que vio
+# cada modelo durante el entrenamiento.
+# ─────────────────────────────────────────────────────────────────────────
+FILTROS_SEGMENTO = {
+    "papa_negra": {
+        "nombres_prod": ["Papa negra", "papa negra", "PAPA NEGRA"],
+        "ciudades_norm": None,  # Papa Negra solo existe para Bogotá en los datos
+    },
+    "papa_amarilla_BOGOTA": {
+        "nombres_prod": ["Papa criolla", "papa criolla", "PAPA CRIOLLA",
+                         "Papa amarilla", "papa amarilla", "PAPA AMARILLA"],
+        "ciudades_norm": ["Bogotá", "BOGOTA", "Bogota", "bogota", "BOGOTÁ", "bogotá"],
+    },
+    "papa_amarilla_TUNJA": {
+        "nombres_prod": ["Papa criolla", "papa criolla", "PAPA CRIOLLA",
+                         "Papa amarilla", "papa amarilla", "PAPA AMARILLA"],
+        "ciudades_norm": ["Tunja", "TUNJA", "tunja"],
+    },
+}
+
+# Misma hoja usada en el notebook de entrenamiento (df_final3)
+RUTA_DATOS_REALES = os.environ.get(
+    "RUTA_DATOS_REALES",
+    "https://docs.google.com/spreadsheets/d/15qCMwQkMm44_T_95mW-O5Xe7L6HHu-12/export?format=xlsx",
+)
+# Cada cuántas horas se refresca la hoja completa desde Google Sheets
+HORAS_REFRESCO_DATOS = float(os.environ.get("HORAS_REFRESCO_DATOS", "6"))
 
 MODELOS_CONFIG = [
     {
@@ -106,6 +122,98 @@ MODELOS_CONFIG = [
 
 # Cache en memoria para evitar accesos repetitivos a disco (I/O)
 MODEL_CACHE = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🆕 v7.14: CARGA DEL HISTÓRICO REAL (reemplaza el histórico simulado)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Cache del histórico REAL por segmento: {producto: (DataFrame, fecha_de_carga)}
+DATOS_REALES_CACHE = {}
+
+
+def _descargar_tabla_maestra() -> pd.DataFrame:
+    """
+    Descarga df_final3 desde el mismo Google Sheets usado en entrenamiento,
+    y replica EXACTAMENTE el recorte global que hace el notebook del LSTM
+    antes de filtrar por producto/ciudad: tmedia_c_lag20 = tmedia_c.shift(20)
+    + dropna sobre la tabla completa. Sin esto, tmedia_c_lag20 no
+    coincidiría con lo que el modelo vio durante el entrenamiento.
+    """
+    print(f"[DATOS REALES] Descargando tabla maestra desde: {RUTA_DATOS_REALES}")
+    df = pd.read_excel(RUTA_DATOS_REALES)
+    df["fecha_join"] = pd.to_datetime(df["fecha_join"])
+    df = df.sort_values("fecha_join").reset_index(drop=True)
+
+    df["tmedia_c_lag20"] = df["tmedia_c"].shift(20)
+    df = df.dropna(subset=["tmedia_c_lag20"])  # mismo recorte que en entrenamiento
+
+    print(f"[DATOS REALES] Tabla maestra descargada: {df.shape[0]} filas.")
+    return df
+
+
+def _filtrar_y_preparar_segmento(df_maestro: pd.DataFrame, producto: str) -> pd.DataFrame:
+    """
+    Replica cargar_serie() del notebook de entrenamiento: filtra por
+    producto_norm/ciudad_norm, deduplica fechas con 'last', interpola
+    huecos con method='time' + ffill/bfill. Devuelve una serie diaria con
+    TODAS las columnas necesarias (precio + exógenas), indexada por fecha.
+    """
+    filtro = FILTROS_SEGMENTO[producto]
+    df_v = df_maestro[df_maestro["producto_norm"].isin(filtro["nombres_prod"])].copy()
+    if filtro["ciudades_norm"] is not None:
+        df_v = df_v[df_v["ciudad_norm"].isin(filtro["ciudades_norm"])]
+
+    if df_v.empty:
+        raise RuntimeError(f"Sin datos reales disponibles para el segmento '{producto}'.")
+
+    columnas = ["precio_promedio", "tmedia_c", "tmedia_c_lag20", "prec30_mm",
+                "Cant_Ton_Total", "costo_total"]
+    df_v = df_v.sort_values("fecha_join").set_index("fecha_join")[columnas]
+
+    if df_v.index.duplicated().any():
+        df_v = df_v.groupby(df_v.index).last()
+
+    df_v = df_v.interpolate(method="time").ffill().bfill()
+    return df_v
+
+
+def obtener_historico_real(producto: str, min_dias: int) -> pd.DataFrame:
+    """
+    Devuelve al menos `min_dias` filas más recientes del histórico real
+    para `producto`, usando cache en memoria (se refresca cada
+    HORAS_REFRESCO_DATOS horas, no en cada solicitud).
+    """
+    ahora = datetime.utcnow()
+    entrada_cache = DATOS_REALES_CACHE.get(producto)
+
+    necesita_refresco = (
+        entrada_cache is None
+        or (ahora - entrada_cache[1]) > timedelta(hours=HORAS_REFRESCO_DATOS)
+    )
+
+    if necesita_refresco:
+        try:
+            df_maestro = _descargar_tabla_maestra()
+            for key in FILTROS_SEGMENTO:
+                DATOS_REALES_CACHE[key] = (_filtrar_y_preparar_segmento(df_maestro, key), ahora)
+            entrada_cache = DATOS_REALES_CACHE.get(producto)
+        except Exception as e:
+            # Si falla la descarga y ya había un cache previo (aunque esté
+            # vencido), lo seguimos usando en vez de tumbar el servicio.
+            print(f"[DATOS REALES] Falló el refresco ({e}); usando cache previo si existe.")
+            if entrada_cache is None:
+                raise RuntimeError(
+                    f"No hay histórico real disponible para '{producto}' y la descarga falló: {e}"
+                )
+
+    df_segmento = entrada_cache[0]
+    if len(df_segmento) < min_dias:
+        raise RuntimeError(
+            f"El histórico real de '{producto}' solo tiene {len(df_segmento)} días; "
+            f"se requieren al menos {min_dias}."
+        )
+    return df_segmento.tail(min_dias).copy()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCIONES MATEMÁTICAS Y DE PREPROCESAMIENTO ORIGINALES
@@ -171,14 +279,13 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 
     # ── Predicción central (sin ruido) ──────────────────────────────────
     X_inf = _transformar_ventana(datos_raw_base, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base)
-    
-    # Inferencia envuelta de forma segura en la CPU para evitar colisiones CUDA en producción
+
     with tf.device('/CPU:0'):
         pred_sc = model.predict(X_inf, verbose=0)[0, 0]
-        
+
     pred_inv = scaler_target.inverse_transform([[pred_sc]])[0, 0]
     pred_cop = float(precio_base_cop) * np.exp(pred_inv) if usar_diff else pred_inv
-    
+
     col_std = datos_raw_base.std(axis=0)
     col_std[col_std == 0] = 1e-9  # Evita ruido nulo en columnas constantes
 
@@ -188,25 +295,21 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
         datos_raw_noisy = datos_raw_base + noise
 
         X_boot = _transformar_ventana(datos_raw_noisy, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base)
-        
-        # Simulación de bootstrap corrida de manera segura en CPU
+
         with tf.device('/CPU:0'):
             p_sc = model.predict(X_boot, verbose=0)[0, 0]
-            
+
         p_inv = scaler_target.inverse_transform([[p_sc]])[0, 0]
         p_cop = float(precio_base_cop) * np.exp(p_inv) if usar_diff else p_inv
 
         if np.isfinite(p_cop):
             preds_boot.append(p_cop)
-    
+
     if len(preds_boot) < 2:
-        # Bootstrap degenerado (todas las muestras cayeron no-finitas):
-        # No hay base para estimar dispersión, colapsamos el IC al punto.
         ic_inf, ic_sup = pred_cop, pred_cop
     else:
         ic_inf, ic_sup = np.percentile(preds_boot, [2.5, 97.5])
 
-    
     if not np.isfinite(pred_cop) or pred_cop <= 0:
         raise ValueError(
             f"Predicción no válida (no positiva o no finita) para "
@@ -218,7 +321,6 @@ def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.Dat
 
     ic_inf, ic_sup = min(ic_inf, ic_sup), max(ic_inf, ic_sup)
 
-    # Sincronización de fecha destino
     fecha_futura = df_reciente.index[-1] + pd.Timedelta(days=h)
 
     return {
@@ -245,43 +347,64 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
         model_path = os.path.join(MODELS_DIR, f"best_{modelo_key}_h{h}.keras")
         sf_path = os.path.join(MODELS_DIR, f"scaler_full_{modelo_key}.pkl")
         st_path = os.path.join(MODELS_DIR, f"scaler_target_{modelo_key}.pkl")
-        
+
         print(f"[DEBUG ARTEFACTOS] Buscando archivos en ruta absoluta: {model_path}")
-        
+
         if not os.path.exists(model_path) or not os.path.exists(sf_path) or not os.path.exists(st_path):
             faltantes = [p for p in [model_path, sf_path, st_path] if not os.path.exists(p)]
             raise FileNotFoundError(
                 f"Faltan archivos binarios de la red neuronal o scalers. Faltantes: {faltantes}"
             )
-            
-        # Carga ultra-segura aislando hilos y desactivando optimizaciones de compilación
+
         print(f"[DEBUG TENSORFLOW] Intentando deserializar {model_path} con compile=False en CPU...")
         try:
             with tf.device('/CPU:0'):
-                # Usamos custom_objects vacíos para evitar que Keras intente buscar capas personalizadas antiguas
                 model = tf.keras.models.load_model(model_path, compile=False, custom_objects={})
             print("[DEBUG TENSORFLOW] ¡Modelo cargado exitosamente en CPU!")
         except Exception as tf_err:
             print(f"[FATAL TENSORFLOW] Error directo de TensorFlow al cargar {model_path}:")
-            traceback.print_exc()  # Esto imprimirá la traza completa (línea por línea) en los logs de Render
+            traceback.print_exc()
             raise tf_err
-            
-        # Carga de Scalers
+
         scaler_full = joblib.load(sf_path)
         scaler_target = joblib.load(st_path)
-        
-        # Guardar en caché para futuros requests
+
         MODEL_CACHE[cache_key] = (model, scaler_full, scaler_target)
         return model, scaler_full, scaler_target
     except Exception as e:
-        # Esto permite que el error detallado suba hasta la respuesta de tu API HTTP 500 para poder verlo en consola
         error_detallado = f"{str(e)} | Trace: {traceback.format_exc()[-250:]}"
         raise RuntimeError(f"Error crítico cargando la arquitectura del modelo: {error_detallado}")
 
 
+def _construir_df_reciente(producto: str, min_dias: int, overrides: dict) -> pd.DataFrame:
+    """
+    🆕 v7.14: base = histórico REAL (antes: np.random.uniform(...)).
+    Sobre esa base, se sobrescribe el ÚLTIMO día con los valores que el
+    usuario haya ajustado en el simulador (igual que antes), para que la
+    función de "simular escenario" del dashboard siga funcionando igual.
+    """
+    df_reciente = obtener_historico_real(producto, min_dias)
+
+    campo_por_param = {
+        "precio_promedio": "precio_promedio",
+        "tmedia_c": "tmedia_c",
+        "tmedia_c_lag20": "tmedia_c_lag20",
+        "prec30_mm": "prec30_mm",
+        "Cant_Ton_Total": "Cant_Ton_Total",
+        "costo_total": "costo_total",
+    }
+    for param, valor in overrides.items():
+        col = campo_por_param.get(param)
+        if col is not None and valor is not None:
+            df_reciente.iloc[-1, df_reciente.columns.get_loc(col)] = valor
+
+    df_reciente = df_reciente.interpolate(method="time").ffill().bfill()
+    return df_reciente
+
+
 @app.get("/predict")
 def ejecutar_inferencia(
-    producto: str, 
+    producto: str,
     horizonte: int,
     precio_promedio: Optional[float] = None,
     Cant_Ton_Total: Optional[float] = None,
@@ -300,12 +423,6 @@ def ejecutar_inferencia(
     if not cfg:
         raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
 
-    # 🆕 v7.13: además de ser un horizonte "válido" en general (1/7/30),
-    # debe estar HABILITADO para este producto específico. Antes esta capa
-    # de defensa solo existía en Node (prediction.controller.js); se agrega
-    # aquí también para que la API no dependa exclusivamente de que Node
-    # sea quien la llame — cualquier cliente que golpee este puerto
-    # directamente queda protegido igual.
     habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [])
     if horizonte not in habilitados:
         raise HTTPException(
@@ -318,43 +435,30 @@ def ejecutar_inferencia(
         )
 
     try:
-        # Cargar con caché optimizada
         model, scaler_full, scaler_target = cargar_artefactos_con_cache(producto, horizonte)
-        
-        # Generar histórico simulado
-        # periods=95 para garantizar margen suficiente incluso en escenarios
-        # con DIFERENCIAR=True (se pierde 1 registro) y horizontes largos (h=30).
-        idx = pd.date_range(end=pd.Timestamp.now(), periods=95, freq='D')
-        df_reciente = pd.DataFrame({
-            "precio_promedio": np.random.uniform(2300, 2600, 95),
-            "tmedia_c": np.random.uniform(14, 18, 95),
-            "tmedia_c_lag20": np.random.uniform(14, 18, 95),
-            "prec30_mm": np.random.uniform(10, 60, 95),
-            "Cant_Ton_Total": np.random.uniform(150, 350, 95),
-            "costo_total": np.random.uniform(1500, 2200, 95)
-        }, index=idx)
 
-        # Inyectar inputs del cliente en el último registro ("El presente")
-        if precio_promedio is not None: df_reciente.iloc[-1, df_reciente.columns.get_loc("precio_promedio")] = precio_promedio
-        if tmedia_c is not None:        df_reciente.iloc[-1, df_reciente.columns.get_loc("tmedia_c")] = tmedia_c
-        if tmedia_c_lag20 is not None:  df_reciente.iloc[-1, df_reciente.columns.get_loc("tmedia_c_lag20")] = tmedia_c_lag20
-        if prec30_mm is not None:       df_reciente.iloc[-1, df_reciente.columns.get_loc("prec30_mm")] = prec30_mm
-        if Cant_Ton_Total is not None:  df_reciente.iloc[-1, df_reciente.columns.get_loc("Cant_Ton_Total")] = Cant_Ton_Total
-        if costo_total is not None:     df_reciente.iloc[-1, df_reciente.columns.get_loc("costo_total")] = costo_total
-
-        df_reciente = df_reciente.interpolate(method="time").ffill().bfill()
+        # 🆕 v7.14: histórico real (95 días, igual margen que antes) en vez de simulado
+        overrides = {
+            "precio_promedio": precio_promedio,
+            "tmedia_c": tmedia_c,
+            "tmedia_c_lag20": tmedia_c_lag20,
+            "prec30_mm": prec30_mm,
+            "Cant_Ton_Total": Cant_Ton_Total,
+            "costo_total": costo_total,
+        }
+        df_reciente = _construir_df_reciente(producto, min_dias=95, overrides=overrides)
         precio_actual_base = float(df_reciente[TARGET].iloc[-1])
-        
+
         response_payload = predecir_nuevos_datos(
-            model=model, 
-            scaler_full=scaler_full, 
-            scaler_target=scaler_target, 
-            df_reciente=df_reciente, 
-            h=horizonte, 
-            modelo_key=producto, 
+            model=model,
+            scaler_full=scaler_full,
+            scaler_target=scaler_target,
+            df_reciente=df_reciente,
+            h=horizonte,
+            modelo_key=producto,
             precio_base_cop=precio_actual_base
         )
-        
+
         return response_payload
 
     except HTTPException:
@@ -370,27 +474,16 @@ def ejecutar_inferencia(
 def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual_base: float, dias: int = 30) -> list:
     """
     Genera una curva de precios DIARIOS (día 1 a `dias`) a partir de:
-    - Forecasting recursivo con el modelo h=1 (predice día a día, alimentando
-      cada predicción como insumo para la siguiente).
-    - Calibración con los modelos h=7 y h=30 como "anclas": la curva recursiva
-      se corrige para que pase exactamente por esos dos puntos, ÚNICAMENTE
-      cuando esos horizontes están habilitados para el producto (ver
-      HORIZONTES_HABILITADOS_POR_PRODUCTO).
-
-    🆕 v7.13: antes esta función intentaba cargar y usar los modelos h=7 y
-    h=30 para CUALQUIER producto, sin importar su desempeño de validación.
-    Para papa_amarilla_BOGOTA (R²=-0.38 en h=7, R²=-0.96 en h=30) y
-    papa_amarilla_TUNJA (R²=-11.56 en h=7), esto significaba calibrar la
-    curva diaria contra un modelo que predice peor que el promedio
-    histórico. Ahora, si un ancla no está habilitada para el producto, se
-    omite directamente (ni se carga ni se predice con ella) y la curva
-    para ese tramo queda puramente recursiva (h=1), sin calibración externa.
+    - Forecasting recursivo con el modelo h=1.
+    - Calibración con los modelos h=7 y h=30 como "anclas", únicamente
+      cuando esos horizontes están habilitados para el producto.
 
     LIMITACIÓN IMPORTANTE (sigue vigente): las variables exógenas (clima,
-    costos, toneladas) se mantienen constantes en su último valor conocido
-    durante toda la recursión, porque no existe un pronóstico real de esas
-    variables a futuro. Esto es una aproximación, no una predicción certera
-    día a día.
+    costos, toneladas) se mantienen constantes en su último valor real
+    conocido durante toda la recursión, porque no existe un pronóstico
+    real de esas variables a futuro. Esto es una aproximación, no una
+    predicción certera día a día — pero al menos ahora arranca desde un
+    histórico real, no desde ruido aleatorio.
     """
     model_h1, sf_h1, st_h1 = cargar_artefactos_con_cache(producto, 1)
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
@@ -406,7 +499,6 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     feat_idx_h1 = [features.index(f) for f in features_h1]
     ops_agr_h1 = [ops_agr[i] for i in feat_idx_h1]
 
-    # Copia de trabajo del histórico que se irá extendiendo día a día
     df_trabajo = df_reciente[features].copy()
 
     ultima_fecha = df_trabajo.index[-1]
@@ -415,7 +507,6 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     curva_recursiva = []
 
     for dia in range(1, dias + 1):
-        # Preparamos la ventana según si el modelo usa diferenciación o no
         if usar_diff:
             df_diff = df_trabajo.copy()
             df_diff[TARGET] = np.log(df_diff[TARGET] / df_diff[TARGET].shift(1))
@@ -427,11 +518,10 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
             precio_ancla_paso = None
 
         if len(datos_raw) < window_base:
-            break  # histórico insuficiente para seguir extrapolando
+            break
 
         X_inf = _transformar_ventana(datos_raw, sf_h1, feat_idx_h1, ops_agr_h1, 1, modo, window_base)
 
-        # Inferencia envuelta de forma segura en la CPU, igual que en predecir_nuevos_datos
         with tf.device('/CPU:0'):
             pred_sc = model_h1.predict(X_inf, verbose=0)[0, 0]
 
@@ -439,13 +529,11 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
         pred_cop = precio_ancla_paso * np.exp(pred_inv) if usar_diff else pred_inv
 
         if not np.isfinite(pred_cop) or pred_cop <= 0:
-            break  # divergencia numérica, detenemos la recursión
+            break
 
         fecha_dia = ultima_fecha + pd.Timedelta(days=dia)
         curva_recursiva.append({"fecha": fecha_dia, "dia": dia, "precio_recursivo": float(pred_cop)})
 
-        # Agregamos la predicción como nueva fila histórica, manteniendo
-        # las exógenas constantes en su último valor real conocido.
         nueva_fila = ultima_fila_exogenas.copy()
         nueva_fila[TARGET] = pred_cop
         df_trabajo.loc[fecha_dia] = nueva_fila
@@ -453,17 +541,11 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     if not curva_recursiva:
         raise ValueError("No fue posible generar la curva diaria: histórico insuficiente.")
 
-    # ── Calibración con anclas h=7 y h=30 ───────────────────────────────
-    # 🆕 v7.13: solo se intenta cargar/predecir con un h_ancla si está
-    # habilitado para este producto. Antes el chequeo era únicamente
-    # "if h_ancla <= len(curva_recursiva)", sin mirar desempeño de validación.
     horizontes_habilitados_producto = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
     anclas = {}
-    anclas_omitidas_por_desempeno = []
     for h_ancla in [7, 30]:
         if h_ancla not in horizontes_habilitados_producto:
-            anclas_omitidas_por_desempeno.append(h_ancla)
-            continue  # este horizonte tiene R² negativo para este producto: no se usa como ancla
+            continue
         if h_ancla <= len(curva_recursiva):
             try:
                 model_h, sf_h, st_h = cargar_artefactos_con_cache(producto, h_ancla)
@@ -472,14 +554,8 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
                 )
                 anclas[h_ancla] = resultado_ancla["precio_predicho_COP_kg"]
             except Exception:
-                pass  # si falta el artefacto de ese horizonte, seguimos sin esa ancla
+                pass
 
-    # Distribuimos la corrección (diferencia entre curva recursiva y ancla)
-    # de forma lineal entre los tramos [0, 7] y [7, 30], para que la curva
-    # pase exactamente por los puntos confiables sin saltos bruscos.
-    # Si un ancla no está habilitada (o no se pudo calcular), anclas.get(...)
-    # cae al propio valor recursivo, y el residual correspondiente da 0 —
-    # es decir, ese tramo queda puramente recursivo, sin calibración externa.
     residual_7 = anclas.get(7, curva_recursiva[6]["precio_recursivo"]) - curva_recursiva[6]["precio_recursivo"] if len(curva_recursiva) >= 7 else 0
     residual_30 = anclas.get(30, curva_recursiva[-1]["precio_recursivo"]) - curva_recursiva[-1]["precio_recursivo"] if len(curva_recursiva) >= 30 else residual_7
 
@@ -519,31 +595,20 @@ def ejecutar_curva_diaria(
         raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
 
     try:
-        idx = pd.date_range(end=pd.Timestamp.now(), periods=95, freq='D')
-        df_reciente = pd.DataFrame({
-            "precio_promedio": np.random.uniform(2300, 2600, 95),
-            "tmedia_c": np.random.uniform(14, 18, 95),
-            "tmedia_c_lag20": np.random.uniform(14, 18, 95),
-            "prec30_mm": np.random.uniform(10, 60, 95),
-            "Cant_Ton_Total": np.random.uniform(150, 350, 95),
-            "costo_total": np.random.uniform(1500, 2200, 95)
-        }, index=idx)
-
-        if precio_promedio is not None: df_reciente.iloc[-1, df_reciente.columns.get_loc("precio_promedio")] = precio_promedio
-        if tmedia_c is not None:        df_reciente.iloc[-1, df_reciente.columns.get_loc("tmedia_c")] = tmedia_c
-        if tmedia_c_lag20 is not None:  df_reciente.iloc[-1, df_reciente.columns.get_loc("tmedia_c_lag20")] = tmedia_c_lag20
-        if prec30_mm is not None:       df_reciente.iloc[-1, df_reciente.columns.get_loc("prec30_mm")] = prec30_mm
-        if Cant_Ton_Total is not None:  df_reciente.iloc[-1, df_reciente.columns.get_loc("Cant_Ton_Total")] = Cant_Ton_Total
-        if costo_total is not None:     df_reciente.iloc[-1, df_reciente.columns.get_loc("costo_total")] = costo_total
-
-        df_reciente = df_reciente.interpolate(method="time").ffill().bfill()
+        # 🆕 v7.14: histórico real en vez de simulado
+        overrides = {
+            "precio_promedio": precio_promedio,
+            "tmedia_c": tmedia_c,
+            "tmedia_c_lag20": tmedia_c_lag20,
+            "prec30_mm": prec30_mm,
+            "Cant_Ton_Total": Cant_Ton_Total,
+            "costo_total": costo_total,
+        }
+        df_reciente = _construir_df_reciente(producto, min_dias=95, overrides=overrides)
         precio_actual_base = float(df_reciente[TARGET].iloc[-1])
 
         curva = generar_curva_diaria(producto, df_reciente, precio_actual_base, dias=dias)
 
-        # 🆕 v7.13: informamos en la respuesta si la curva quedó puramente
-        # recursiva (sin anclas h=7/h=30) por desempeño insuficiente, para
-        # que el frontend pueda, si quiere, mostrar un aviso adicional.
         habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
         anclas_disponibles = [h for h in [7, 30] if h in habilitados]
 
