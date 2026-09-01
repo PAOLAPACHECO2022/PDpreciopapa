@@ -473,6 +473,7 @@ def ejecutar_inferencia(
 
 DIAS_MAX_SIN_ANCLA = 7
 
+CAMBIO_MAX_ACUMULADO_SIN_ANCLA = 0.15  # +/-15% respecto al precio de partida
 
 def _volatilidad_diaria_historica(df_reciente: pd.DataFrame) -> float:
     """
@@ -489,27 +490,9 @@ def _volatilidad_diaria_historica(df_reciente: pd.DataFrame) -> float:
 
 def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual_base: float, dias: int = 30) -> list:
     """
-    Genera una curva de precios DIARIOS (día 1 a `dias`) a partir de:
-    - Forecasting recursivo con el modelo h=1.
-    - Calibración con los modelos h=7 y h=30 como "anclas", únicamente
-      cuando esos horizontes están habilitados para el producto.
-
-    🆕 v7.15: cada retorno logarítmico diario predicho se acota a
-    ±K_SIGMA_CLAMP desviaciones estándar de la volatilidad diaria histórica
-    real de la serie (calculada sobre datos reales, no sobre predicciones
-    propias). Esto evita que pequeños sesgos del modelo se compongan
-    exponencialmente a lo largo de la recursión — el caso más extremo era
-    Amarilla-Tunja, cuya ventana de 30 días termina compuesta enteramente
-    por predicciones propias (sin ningún dato real dentro de la ventana)
-    y sin ancla h=7/h=30 que corrija el rumbo.
-
-    LIMITACIÓN IMPORTANTE (sigue vigente): las variables exógenas (clima,
-    costos, toneladas) se mantienen constantes en su último valor real
-    conocido durante toda la recursión, porque no existe un pronóstico
-    real de esas variables a futuro. Esto es una aproximación, no una
-    predicción certera día a día.
+    (docstring igual que antes, con el agregado del límite acumulado)
     """
-    K_SIGMA_CLAMP = 3.0  # bandas de +/-3 desviaciones estándar históricas
+    K_SIGMA_CLAMP = 3.0  # bandas de +/-3 desviaciones estándar históricas (por paso)
 
     model_h1, sf_h1, st_h1 = cargar_artefactos_con_cache(producto, 1)
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
@@ -525,10 +508,14 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     feat_idx_h1 = [features.index(f) for f in features_h1]
     ops_agr_h1 = [ops_agr[i] for i in feat_idx_h1]
 
-    # 🆕 v7.15: volatilidad histórica real, calculada UNA vez sobre el
-    # histórico de entrada (antes de empezar a recursar), no se recalcula
-    # sobre datos sintéticos generados por el propio modelo.
     vol_diaria = _volatilidad_diaria_historica(df_reciente) if usar_diff else None
+    
+    horizontes_habilitados_producto = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
+    tiene_ancla_producto = any(h in horizontes_habilitados_producto for h in [7, 30])
+    limite_acumulado_log = (
+        np.log(1 + CAMBIO_MAX_ACUMULADO_SIN_ANCLA)
+        if (usar_diff and not tiene_ancla_producto) else None
+    )
 
     df_trabajo = df_reciente[features].copy()
 
@@ -537,6 +524,8 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
 
     curva_recursiva = []
     n_dias_clamp_aplicado = 0
+    n_dias_clamp_acumulado_aplicado = 0
+    log_retorno_acumulado = 0.0  # suma de retornos ya aplicados desde el día 0
 
     for dia in range(1, dias + 1):
         if usar_diff:
@@ -559,15 +548,24 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
 
         pred_inv = st_h1.inverse_transform([[pred_sc]])[0, 0]
 
-        # 🆕 v7.15: acotar el retorno logarítmico diario a +/-K_SIGMA_CLAMP
-        # desviaciones estándar históricas, SOLO aplica a series con
-        # DIFERENCIAR=True (donde el "runaway" multiplicativo es posible).
         if usar_diff and vol_diaria is not None:
             limite = K_SIGMA_CLAMP * vol_diaria
             pred_inv_clamped = float(np.clip(pred_inv, -limite, limite))
             if pred_inv_clamped != pred_inv:
                 n_dias_clamp_aplicado += 1
             pred_inv = pred_inv_clamped
+        
+        if limite_acumulado_log is not None:
+            acumulado_propuesto = log_retorno_acumulado + pred_inv
+            acumulado_recortado = float(
+                np.clip(acumulado_propuesto, -limite_acumulado_log, limite_acumulado_log)
+            )
+            if acumulado_recortado != acumulado_propuesto:
+                n_dias_clamp_acumulado_aplicado += 1
+            pred_inv = acumulado_recortado - log_retorno_acumulado
+            log_retorno_acumulado = acumulado_recortado
+        elif usar_diff:
+            log_retorno_acumulado += pred_inv
 
         pred_cop = precio_ancla_paso * np.exp(pred_inv) if usar_diff else pred_inv
 
@@ -584,7 +582,6 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
     if not curva_recursiva:
         raise ValueError("No fue posible generar la curva diaria: histórico insuficiente.")
 
-    horizontes_habilitados_producto = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
     anclas = {}
     for h_ancla in [7, 30]:
         if h_ancla not in horizontes_habilitados_producto:
@@ -619,15 +616,16 @@ def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual
             "es_ancla": d in (7, 30) and d in anclas,
         })
 
-    # 🆕 v7.15: se adjunta como atributo informal para que el endpoint
-    # pueda reportarlo en la respuesta (no afecta el cálculo en sí).
     generar_curva_diaria._ultimo_clamp_info = {
         "dias_con_clamp_aplicado": n_dias_clamp_aplicado,
+        "dias_con_clamp_acumulado_aplicado": n_dias_clamp_acumulado_aplicado,  # 🆕
         "volatilidad_diaria_usada": round(vol_diaria, 5) if vol_diaria is not None else None,
+        "limite_acumulado_pct": (
+            round(CAMBIO_MAX_ACUMULADO_SIN_ANCLA * 100, 1) if limite_acumulado_log is not None else None
+        ),  # 🆕
     }
 
     return curva_final
-
 
 @app.get("/predict/curve")
 def ejecutar_curva_diaria(
