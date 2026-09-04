@@ -1,12 +1,9 @@
 import os
-
 # ══════════════════════════════════════════════════════════════════════════════
 # VARIABLES DE ENTORNO PARA OPTIMIZAR TENSORFLOW EN PRODUCCIÓN (MODO CPU)
 # ══════════════════════════════════════════════════════════════════════════════
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = (
-    "3"  # Silencia advertencias innecesarias de TF e inicializaciones de CUDA
-)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Silencia advertencias innecesarias de TF e inicializaciones de CUDA
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,13 +17,26 @@ import joblib
 import warnings
 import traceback
 import requests
-
+import threading
+import pickle
+import gc
+from collections import OrderedDict
 warnings.filterwarnings("ignore")
+
+# 🆕 Limita los hilos internos de TensorFlow: por defecto TF reserva pools de
+# hilos según los cores disponibles, lo que en instancias pequeñas (Render
+# free/starter) suma overhead de memoria innecesario para un servicio que
+# solo hace inferencia (no entrenamiento) y no necesita paralelismo agresivo.
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except Exception as _tf_thread_err:
+    print(f"[TF CONFIG] No se pudo limitar threads de TensorFlow: {_tf_thread_err}")
 
 app = FastAPI(
     title="Agro Inferencia API",
     description="Motor predictivo optimizado basado en redes recurrentes LSTM v7.14 para precios agrícolas",
-    version="7.14",
+    version="7.14"
 )
 
 app.add_middleware(
@@ -62,25 +72,13 @@ FILTROS_SEGMENTO = {
         "ciudades_norm": None,  # Papa Negra solo existe para Bogotá en los datos
     },
     "papa_amarilla_BOGOTA": {
-        "nombres_prod": [
-            "Papa criolla",
-            "papa criolla",
-            "PAPA CRIOLLA",
-            "Papa amarilla",
-            "papa amarilla",
-            "PAPA AMARILLA",
-        ],
+        "nombres_prod": ["Papa criolla", "papa criolla", "PAPA CRIOLLA",
+                         "Papa amarilla", "papa amarilla", "PAPA AMARILLA"],
         "ciudades_norm": ["Bogotá", "BOGOTA", "Bogota", "bogota", "BOGOTÁ", "bogotá"],
     },
     "papa_amarilla_TUNJA": {
-        "nombres_prod": [
-            "Papa criolla",
-            "papa criolla",
-            "PAPA CRIOLLA",
-            "Papa amarilla",
-            "papa amarilla",
-            "PAPA AMARILLA",
-        ],
+        "nombres_prod": ["Papa criolla", "papa criolla", "PAPA CRIOLLA",
+                         "Papa amarilla", "papa amarilla", "PAPA AMARILLA"],
         "ciudades_norm": ["Tunja", "TUNJA", "tunja"],
     },
 }
@@ -134,7 +132,7 @@ MODELOS_CONFIG = [
         },
         "ops_agregacion": ["last", "mean", "mean", "mean", "sum", "sum"],
         "modo_secuencia": "directo",
-        "params": {"DIFERENCIAR": False, "WINDOW_SIZE": 60},
+        "params": {"DIFERENCIAR": False, "WINDOW_SIZE": 60}
     },
     {
         "key": "papa_amarilla_BOGOTA",
@@ -143,19 +141,50 @@ MODELOS_CONFIG = [
         # completo de "features" para h=1, h=7 y ahora también h=30.
         "ops_agregacion": ["last", "sum", "sum", "mean"],
         "modo_secuencia": "agregado",
-        "params": {"DIFERENCIAR": True, "WINDOW_SIZE": 60},
+        "params": {"DIFERENCIAR": True, "WINDOW_SIZE": 60}
     },
     {
         "key": "papa_amarilla_TUNJA",
         "features": ["precio_promedio", "Cant_Ton_Total", "costo_total", "tmedia_c"],
         "ops_agregacion": ["last", "sum", "sum", "mean"],
         "modo_secuencia": "agregado",
-        "params": {"DIFERENCIAR": True, "WINDOW_SIZE": 30},
-    },
+        "params": {"DIFERENCIAR": True, "WINDOW_SIZE": 30}
+    }
 ]
 
-# Cache en memoria para evitar accesos repetitivos a disco (I/O)
-MODEL_CACHE = {}
+# ══════════════════════════════════════════════════════════════════════════════
+# 🆕 CACHE DE MODELOS CON LÍMITE (LRU) — evita que TensorFlow acumule en RAM
+# todos los modelos que alguna vez se han pedido. En el peor caso este
+# servicio puede cargar hasta 5 modelos distintos (papa_negra h=1/7/30,
+# papa_amarilla_BOGOTA h=1, papa_amarilla_TUNJA h=1); cada uno con su propio
+# runtime de TensorFlow puede sumar cientos de MB, lo que en instancias
+# pequeñas de Render provoca reinicios por out-of-memory (que a su vez
+# generan los 503/429 vistos en el frontend). Con esto, el cache descarta el
+# modelo menos usado recientemente cuando se supera MODEL_CACHE_MAX.
+# ══════════════════════════════════════════════════════════════════════════════
+MODEL_CACHE_MAX = int(os.environ.get("MODEL_CACHE_MAX", "3"))
+MODEL_CACHE = OrderedDict()
+MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _model_cache_get(cache_key: str):
+    with MODEL_CACHE_LOCK:
+        if cache_key in MODEL_CACHE:
+            MODEL_CACHE.move_to_end(cache_key)
+            return MODEL_CACHE[cache_key]
+    return None
+
+
+def _model_cache_set(cache_key: str, value: tuple):
+    with MODEL_CACHE_LOCK:
+        MODEL_CACHE[cache_key] = value
+        MODEL_CACHE.move_to_end(cache_key)
+        while len(MODEL_CACHE) > MODEL_CACHE_MAX:
+            clave_vieja, _valor_viejo = MODEL_CACHE.popitem(last=False)
+            print(f"[MODEL_CACHE] Límite alcanzado ({MODEL_CACHE_MAX}); liberando modelo menos usado: {clave_vieja}")
+    # gc.collect() fuera del lock: libera la referencia recién eliminada
+    gc.collect()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 🆕 v7.14: CARGA DEL HISTÓRICO REAL (reemplaza el histórico simulado)
@@ -163,6 +192,37 @@ MODEL_CACHE = {}
 
 # Cache del histórico REAL por segmento: {producto: (DataFrame, fecha_de_carga)}
 DATOS_REALES_CACHE = {}
+
+# 🆕 Lock para que dos requests concurrentes nunca disparen dos descargas de
+# la hoja de Google Sheets al mismo tiempo (causa directa del 429 visto en
+# producción: Google responde "Too Many Requests" al endpoint anónimo de
+# export cuando llegan varias descargas simultáneas, algo muy probable justo
+# después de que el proceso se reinicia y el cache en RAM se pierde).
+DATOS_REALES_LOCK = threading.Lock()
+
+# 🆕 Cache en disco de la tabla maestra: sobrevive a un reinicio del proceso
+# (por ejemplo tras un out-of-memory kill en Render), así la primera
+# petición después de un reinicio no depende obligatoriamente de que Google
+# Sheets responda a tiempo.
+CACHE_DISCO_PATH = os.path.join(BASE_DIR, "_cache_tabla_maestra.pkl")
+
+
+def _guardar_cache_disco(df_maestro: pd.DataFrame, momento: datetime) -> None:
+    try:
+        with open(CACHE_DISCO_PATH, "wb") as f:
+            pickle.dump({"df": df_maestro, "momento": momento}, f)
+    except Exception as e:
+        print(f"[DATOS REALES] No se pudo persistir el cache en disco: {e}")
+
+
+def _cargar_cache_disco():
+    """Devuelve (df_maestro, momento) desde disco, o (None, None) si no existe/falla."""
+    try:
+        with open(CACHE_DISCO_PATH, "rb") as f:
+            data = pickle.load(f)
+        return data.get("df"), data.get("momento")
+    except Exception:
+        return None, None
 
 
 def _descargar_precios_recientes_sipsa() -> pd.DataFrame:
@@ -191,13 +251,11 @@ def _descargar_precios_recientes_sipsa() -> pd.DataFrame:
 
 
 def _extender_con_precios_recientes(df_v: pd.DataFrame, producto: str) -> pd.DataFrame:
-
+    
     try:
         df_sipsa = _descargar_precios_recientes_sipsa()
     except Exception as e:
-        print(
-            f"[SIPSA] No se pudo obtener precios recientes ({e}); se usa solo el histórico de Sheets."
-        )
+        print(f"[SIPSA] No se pudo obtener precios recientes ({e}); se usa solo el histórico de Sheets.")
         return df_v
 
     filtro = FILTROS_SIPSA.get(producto)
@@ -231,9 +289,8 @@ def _extender_con_precios_recientes(df_v: pd.DataFrame, producto: str) -> pd.Dat
     )
     return df_extendido
 
-
 def _descargar_tabla_maestra() -> pd.DataFrame:
-
+    
     print(f"[DATOS REALES] Descargando tabla maestra desde: {RUTA_DATOS_REALES}")
     df = pd.read_excel(RUTA_DATOS_REALES)
     df["fecha_join"] = pd.to_datetime(df["fecha_join"])
@@ -255,14 +312,8 @@ def _filtrar_y_preparar_segmento(df_maestro: pd.DataFrame, producto: str) -> pd.
     if df_v.empty:
         raise RuntimeError(f"Sin datos reales disponibles para el segmento '{producto}'.")
 
-    columnas = [
-        "precio_promedio",
-        "tmedia_c",
-        "tmedia_c_lag20",
-        "prec30_mm",
-        "Cant_Ton_Total",
-        "costo_total",
-    ]
+    columnas = ["precio_promedio", "tmedia_c", "tmedia_c_lag20", "prec30_mm",
+                "Cant_Ton_Total", "costo_total"]
     df_v = df_v.sort_values("fecha_join").set_index("fecha_join")[columnas]
 
     if df_v.index.duplicated().any():
@@ -280,28 +331,52 @@ def obtener_historico_real(producto: str, min_dias: int) -> pd.DataFrame:
     Devuelve al menos `min_dias` filas más recientes del histórico real
     para `producto`, usando cache en memoria (se refresca cada
     HORAS_REFRESCO_DATOS horas, no en cada solicitud).
+
+    🆕 Ahora protegido con un lock (para no disparar descargas concurrentes
+    a Google Sheets) y con un cache de respaldo en disco (para no depender
+    de Google Sheets justo después de que el proceso se reinicia).
     """
     ahora = datetime.utcnow()
     entrada_cache = DATOS_REALES_CACHE.get(producto)
 
-    necesita_refresco = entrada_cache is None or (ahora - entrada_cache[1]) > timedelta(
-        hours=HORAS_REFRESCO_DATOS
+    necesita_refresco = (
+        entrada_cache is None
+        or (ahora - entrada_cache[1]) > timedelta(hours=HORAS_REFRESCO_DATOS)
     )
 
     if necesita_refresco:
-        try:
-            df_maestro = _descargar_tabla_maestra()
-            for key in FILTROS_SEGMENTO:
-                DATOS_REALES_CACHE[key] = (_filtrar_y_preparar_segmento(df_maestro, key), ahora)
+        with DATOS_REALES_LOCK:
+            # Volvemos a chequear DENTRO del lock: es posible que otro
+            # request ya haya refrescado el cache mientras esperábamos aquí.
             entrada_cache = DATOS_REALES_CACHE.get(producto)
-        except Exception as e:
-            # Si falla la descarga y ya había un cache previo (aunque esté
-            # vencido), lo seguimos usando en vez de tumbar el servicio.
-            print(f"[DATOS REALES] Falló el refresco ({e}); usando cache previo si existe.")
-            if entrada_cache is None:
-                raise RuntimeError(
-                    f"No hay histórico real disponible para '{producto}' y la descarga falló: {e}"
-                )
+            necesita_refresco = (
+                entrada_cache is None
+                or (datetime.utcnow() - entrada_cache[1]) > timedelta(hours=HORAS_REFRESCO_DATOS)
+            )
+
+            if necesita_refresco:
+                try:
+                    df_maestro = _descargar_tabla_maestra()
+                    momento_descarga = datetime.utcnow()
+                    for key in FILTROS_SEGMENTO:
+                        DATOS_REALES_CACHE[key] = (_filtrar_y_preparar_segmento(df_maestro, key), momento_descarga)
+                    _guardar_cache_disco(df_maestro, momento_descarga)
+                    entrada_cache = DATOS_REALES_CACHE.get(producto)
+                except Exception as e:
+                    # Si falla la descarga y ya había un cache previo (aunque esté
+                    # vencido), lo seguimos usando en vez de tumbar el servicio.
+                    print(f"[DATOS REALES] Falló el refresco desde Sheets ({e}); intentando cache previo o de disco.")
+                    if entrada_cache is None:
+                        df_disco, momento_disco = _cargar_cache_disco()
+                        if df_disco is not None:
+                            print(f"[DATOS REALES] Usando cache de disco de {momento_disco}.")
+                            for key in FILTROS_SEGMENTO:
+                                DATOS_REALES_CACHE[key] = (_filtrar_y_preparar_segmento(df_disco, key), momento_disco)
+                            entrada_cache = DATOS_REALES_CACHE.get(producto)
+                        else:
+                            raise RuntimeError(
+                                f"No hay histórico real disponible para '{producto}' y la descarga falló: {e}"
+                            )
 
     df_segmento = entrada_cache[0]
     if len(df_segmento) < min_dias:
@@ -316,10 +391,8 @@ def obtener_historico_real(producto: str, min_dias: int) -> pd.DataFrame:
 # FUNCIONES MATEMÁTICAS Y DE PREPROCESAMIENTO ORIGINALES
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 def agregar_por_horizonte(data_sc: np.ndarray, h: int, ops_agregacion: list) -> np.ndarray:
-    if h == 1:
-        return data_sc
+    if h == 1: return data_sc
     n_bloques = len(data_sc) // h
     n_feat = data_sc.shape[1]
     result = np.zeros((n_bloques, n_feat))
@@ -327,24 +400,14 @@ def agregar_por_horizonte(data_sc: np.ndarray, h: int, ops_agregacion: list) -> 
     for b in range(n_bloques):
         bloque = data_sc[b * h : (b + 1) * h, :]
         for j, op in enumerate(ops_agregacion):
-            if op == "last":
-                result[b, j] = bloque[-1, j]
-            elif op == "sum":
-                result[b, j] = bloque[:, j].sum()
-            else:
-                result[b, j] = bloque[:, j].mean()
+            if op == "last": result[b, j] = bloque[-1, j]
+            elif op == "sum": result[b, j] = bloque[:, j].sum()
+            else: result[b, j] = bloque[:, j].mean()
     return result
 
 
-def _transformar_ventana(
-    datos_raw: np.ndarray,
-    scaler_full,
-    feat_idx_h: list,
-    ops_agr_h: list,
-    h: int,
-    modo: str,
-    window_base: int,
-) -> np.ndarray:
+def _transformar_ventana(datos_raw: np.ndarray, scaler_full, feat_idx_h: list,
+                         ops_agr_h: list, h: int, modo: str, window_base: int) -> np.ndarray:
     datos_sc = scaler_full.transform(datos_raw)[:, feat_idx_h]
 
     if modo == "agregado" and h > 1:
@@ -355,18 +418,10 @@ def _transformar_ventana(
     return datos_sc.reshape(1, datos_sc.shape[0], datos_sc.shape[1])
 
 
-def predecir_nuevos_datos(
-    model,
-    scaler_full,
-    scaler_target,
-    df_reciente: pd.DataFrame,
-    h: int,
-    modelo_key: str,
-    precio_base_cop: float = None,
-) -> dict:
+def predecir_nuevos_datos(model, scaler_full, scaler_target, df_reciente: pd.DataFrame,
+                          h: int, modelo_key: str, precio_base_cop: float = None) -> dict:
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == modelo_key), None)
-    if cfg is None:
-        raise ValueError(f"modelo_key='{modelo_key}' no identificado.")
+    if cfg is None: raise ValueError(f"modelo_key='{modelo_key}' no identificado.")
 
     features = cfg["features"]
     ops_agr = cfg["ops_agregacion"]
@@ -395,11 +450,9 @@ def predecir_nuevos_datos(
     datos_raw_base = df_w.tail(window_base).values
 
     # ── Predicción central (sin ruido) ──────────────────────────────────
-    X_inf = _transformar_ventana(
-        datos_raw_base, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base
-    )
+    X_inf = _transformar_ventana(datos_raw_base, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base)
 
-    with tf.device("/CPU:0"):
+    with tf.device('/CPU:0'):
         pred_sc = model.predict(X_inf, verbose=0)[0, 0]
 
     pred_inv = scaler_target.inverse_transform([[pred_sc]])[0, 0]
@@ -413,11 +466,9 @@ def predecir_nuevos_datos(
         noise = np.random.normal(0, RUIDO_FRAC_STD * col_std, datos_raw_base.shape)
         datos_raw_noisy = datos_raw_base + noise
 
-        X_boot = _transformar_ventana(
-            datos_raw_noisy, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base
-        )
+        X_boot = _transformar_ventana(datos_raw_noisy, scaler_full, feat_idx_h, ops_agr_h, h, modo, window_base)
 
-        with tf.device("/CPU:0"):
+        with tf.device('/CPU:0'):
             p_sc = model.predict(X_boot, verbose=0)[0, 0]
 
         p_inv = scaler_target.inverse_transform([[p_sc]])[0, 0]
@@ -455,15 +506,22 @@ def predecir_nuevos_datos(
         "n_bootstrap_validas": len(preds_boot),
     }
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # AUXILIARES Y ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 def cargar_artefactos_con_cache(modelo_key: str, h: int):
-    """Carga los modelos en memoria una sola vez para optimizar las llamadas."""
+    """Carga los modelos en memoria una sola vez para optimizar las llamadas.
+
+    🆕 Ahora usa un cache LRU con límite (MODEL_CACHE_MAX) en vez de un dict
+    sin límite: si nunca se liberan modelos, TensorFlow puede terminar
+    manteniendo en RAM todos los modelos que alguna vez se pidieron
+    (hasta 5 en este servicio), lo que en instancias pequeñas de hosting
+    provoca reinicios por out-of-memory.
+    """
     cache_key = f"{modelo_key}_h{h}"
-    if cache_key in MODEL_CACHE:
-        return MODEL_CACHE[cache_key]
+    cacheado = _model_cache_get(cache_key)
+    if cacheado is not None:
+        return cacheado
 
     try:
         model_path = os.path.join(MODELS_DIR, f"best_{modelo_key}_h{h}.keras")
@@ -472,21 +530,15 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
 
         print(f"[DEBUG ARTEFACTOS] Buscando archivos en ruta absoluta: {model_path}")
 
-        if (
-            not os.path.exists(model_path)
-            or not os.path.exists(sf_path)
-            or not os.path.exists(st_path)
-        ):
+        if not os.path.exists(model_path) or not os.path.exists(sf_path) or not os.path.exists(st_path):
             faltantes = [p for p in [model_path, sf_path, st_path] if not os.path.exists(p)]
             raise FileNotFoundError(
                 f"Faltan archivos binarios de la red neuronal o scalers. Faltantes: {faltantes}"
             )
 
-        print(
-            f"[DEBUG TENSORFLOW] Intentando deserializar {model_path} con compile=False en CPU..."
-        )
+        print(f"[DEBUG TENSORFLOW] Intentando deserializar {model_path} con compile=False en CPU...")
         try:
-            with tf.device("/CPU:0"):
+            with tf.device('/CPU:0'):
                 model = tf.keras.models.load_model(model_path, compile=False, custom_objects={})
             print("[DEBUG TENSORFLOW] ¡Modelo cargado exitosamente en CPU!")
         except Exception as tf_err:
@@ -497,8 +549,9 @@ def cargar_artefactos_con_cache(modelo_key: str, h: int):
         scaler_full = joblib.load(sf_path)
         scaler_target = joblib.load(st_path)
 
-        MODEL_CACHE[cache_key] = (model, scaler_full, scaler_target)
-        return model, scaler_full, scaler_target
+        resultado = (model, scaler_full, scaler_target)
+        _model_cache_set(cache_key, resultado)
+        return resultado
     except Exception as e:
         error_detallado = f"{str(e)} | Trace: {traceback.format_exc()[-250:]}"
         raise RuntimeError(f"Error crítico cargando la arquitectura del modelo: {error_detallado}")
@@ -539,18 +592,17 @@ def ejecutar_inferencia(
     costo_total: Optional[float] = None,
     tmedia_c: Optional[float] = None,
     tmedia_c_lag20: Optional[float] = None,
-    prec30_mm: Optional[float] = None,
+    prec30_mm: Optional[float] = None
 ):
     if horizonte not in HORIZONTES_VALIDOS:
         raise HTTPException(
-            status_code=400, detail=f"Horizonte inválido. Solo se admite {HORIZONTES_VALIDOS}."
+            status_code=400,
+            detail=f"Horizonte inválido. Solo se admite {HORIZONTES_VALIDOS}."
         )
 
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
     if not cfg:
-        raise HTTPException(
-            status_code=400, detail=f"El producto '{producto}' no está configurado."
-        )
+        raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
 
     habilitados = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [])
     if horizonte not in habilitados:
@@ -560,7 +612,7 @@ def ejecutar_inferencia(
                 f"El horizonte h={horizonte} no está habilitado para '{producto}' "
                 f"por desempeño insuficiente del modelo (R² negativo en validación). "
                 f"Horizontes disponibles para este producto: {habilitados}."
-            ),
+            )
         )
 
     try:
@@ -585,7 +637,7 @@ def ejecutar_inferencia(
             df_reciente=df_reciente,
             h=horizonte,
             modelo_key=producto,
-            precio_base_cop=precio_actual_base,
+            precio_base_cop=precio_actual_base
         )
 
         return response_payload
@@ -593,9 +645,7 @@ def ejecutar_inferencia(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Falla interna en la predicción de la red: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Falla interna en la predicción de la red: {str(e)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -605,7 +655,6 @@ def ejecutar_inferencia(
 DIAS_MAX_SIN_ANCLA = 7
 
 CAMBIO_MAX_ACUMULADO_SIN_ANCLA = 0.15  # +/-15% respecto al precio de partida
-
 
 def _volatilidad_diaria_historica(df_reciente: pd.DataFrame) -> float:
     """
@@ -620,9 +669,7 @@ def _volatilidad_diaria_historica(df_reciente: pd.DataFrame) -> float:
     return vol if np.isfinite(vol) and vol > 0 else 0.05  # 5% como piso defensivo
 
 
-def generar_curva_diaria(
-    producto: str, df_reciente: pd.DataFrame, precio_actual_base: float, dias: int = 30
-) -> list:
+def generar_curva_diaria(producto: str, df_reciente: pd.DataFrame, precio_actual_base: float, dias: int = 30) -> list:
     """
     (docstring igual que antes, con el agregado del límite acumulado)
     """
@@ -643,13 +690,12 @@ def generar_curva_diaria(
     ops_agr_h1 = [ops_agr[i] for i in feat_idx_h1]
 
     vol_diaria = _volatilidad_diaria_historica(df_reciente) if usar_diff else None
-
+    
     horizontes_habilitados_producto = HORIZONTES_HABILITADOS_POR_PRODUCTO.get(producto, [1])
     tiene_ancla_producto = any(h in horizontes_habilitados_producto for h in [7, 30])
     limite_acumulado_log = (
         np.log(1 + CAMBIO_MAX_ACUMULADO_SIN_ANCLA)
-        if (usar_diff and not tiene_ancla_producto)
-        else None
+        if (usar_diff and not tiene_ancla_producto) else None
     )
 
     df_trabajo = df_reciente[features].copy()
@@ -676,11 +722,9 @@ def generar_curva_diaria(
         if len(datos_raw) < window_base:
             break
 
-        X_inf = _transformar_ventana(
-            datos_raw, sf_h1, feat_idx_h1, ops_agr_h1, 1, modo, window_base
-        )
+        X_inf = _transformar_ventana(datos_raw, sf_h1, feat_idx_h1, ops_agr_h1, 1, modo, window_base)
 
-        with tf.device("/CPU:0"):
+        with tf.device('/CPU:0'):
             pred_sc = model_h1.predict(X_inf, verbose=0)[0, 0]
 
         pred_inv = st_h1.inverse_transform([[pred_sc]])[0, 0]
@@ -691,7 +735,7 @@ def generar_curva_diaria(
             if pred_inv_clamped != pred_inv:
                 n_dias_clamp_aplicado += 1
             pred_inv = pred_inv_clamped
-
+        
         if limite_acumulado_log is not None:
             acumulado_propuesto = log_retorno_acumulado + pred_inv
             acumulado_recortado = float(
@@ -710,9 +754,7 @@ def generar_curva_diaria(
             break
 
         fecha_dia = ultima_fecha + pd.Timedelta(days=dia)
-        curva_recursiva.append(
-            {"fecha": fecha_dia, "dia": dia, "precio_recursivo": float(pred_cop)}
-        )
+        curva_recursiva.append({"fecha": fecha_dia, "dia": dia, "precio_recursivo": float(pred_cop)})
 
         nueva_fila = ultima_fila_exogenas.copy()
         nueva_fila[TARGET] = pred_cop
@@ -735,18 +777,8 @@ def generar_curva_diaria(
             except Exception:
                 pass
 
-    residual_7 = (
-        anclas.get(7, curva_recursiva[6]["precio_recursivo"])
-        - curva_recursiva[6]["precio_recursivo"]
-        if len(curva_recursiva) >= 7
-        else 0
-    )
-    residual_30 = (
-        anclas.get(30, curva_recursiva[-1]["precio_recursivo"])
-        - curva_recursiva[-1]["precio_recursivo"]
-        if len(curva_recursiva) >= 30
-        else residual_7
-    )
+    residual_7 = anclas.get(7, curva_recursiva[6]["precio_recursivo"]) - curva_recursiva[6]["precio_recursivo"] if len(curva_recursiva) >= 7 else 0
+    residual_30 = anclas.get(30, curva_recursiva[-1]["precio_recursivo"]) - curva_recursiva[-1]["precio_recursivo"] if len(curva_recursiva) >= 30 else residual_7
 
     curva_final = []
     for punto in curva_recursiva:
@@ -758,28 +790,23 @@ def generar_curva_diaria(
             correccion = residual_7 + (residual_30 - residual_7) * frac
 
         precio_calibrado = punto["precio_recursivo"] + correccion
-        curva_final.append(
-            {
-                "fecha": punto["fecha"].strftime("%Y-%m-%d"),
-                "dia": d,
-                "precio_predicho_COP_kg": round(float(precio_calibrado), 2),
-                "es_ancla": d in (7, 30) and d in anclas,
-            }
-        )
+        curva_final.append({
+            "fecha": punto["fecha"].strftime("%Y-%m-%d"),
+            "dia": d,
+            "precio_predicho_COP_kg": round(float(precio_calibrado), 2),
+            "es_ancla": d in (7, 30) and d in anclas,
+        })
 
     generar_curva_diaria._ultimo_clamp_info = {
         "dias_con_clamp_aplicado": n_dias_clamp_aplicado,
         "dias_con_clamp_acumulado_aplicado": n_dias_clamp_acumulado_aplicado,  # 🆕
         "volatilidad_diaria_usada": round(vol_diaria, 5) if vol_diaria is not None else None,
         "limite_acumulado_pct": (
-            round(CAMBIO_MAX_ACUMULADO_SIN_ANCLA * 100, 1)
-            if limite_acumulado_log is not None
-            else None
+            round(CAMBIO_MAX_ACUMULADO_SIN_ANCLA * 100, 1) if limite_acumulado_log is not None else None
         ),  # 🆕
     }
 
     return curva_final
-
 
 @app.get("/predict/curve")
 def ejecutar_curva_diaria(
@@ -790,13 +817,11 @@ def ejecutar_curva_diaria(
     costo_total: Optional[float] = None,
     tmedia_c: Optional[float] = None,
     tmedia_c_lag20: Optional[float] = None,
-    prec30_mm: Optional[float] = None,
+    prec30_mm: Optional[float] = None
 ):
     cfg = next((m for m in MODELOS_CONFIG if m["key"] == producto), None)
     if not cfg:
-        raise HTTPException(
-            status_code=400, detail=f"El producto '{producto}' no está configurado."
-        )
+        raise HTTPException(status_code=400, detail=f"El producto '{producto}' no está configurado.")
 
     try:
         # si el producto no tiene h=7 ni h=30 habilitados, no hay
@@ -841,8 +866,7 @@ def ejecutar_curva_diaria(
                 f"Este producto solo tiene h=1 validado; la curva se limitó a "
                 f"{DIAS_MAX_SIN_ANCLA} días porque no hay un modelo h=7/h=30 "
                 f"confiable que corrija la proyección más allá de ese punto."
-                if dias_limitados
-                else None
+                if dias_limitados else None
             ),
             "clamp_volatilidad": clamp_info,
             "curva": curva,
@@ -854,7 +878,23 @@ def ejecutar_curva_diaria(
         raise HTTPException(status_code=500, detail=f"Falla generando la curva diaria: {str(e)}")
 
 
+@app.get("/health")
+def health_check():
+    """
+    🆕 Endpoint liviano para keep-alive externo (cron-job.org, UptimeRobot,
+    GitHub Actions, etc.). Pegarle cada 10-14 minutos evita que el proceso
+    entre en cold-start si el plan de hosting duerme instancias inactivas, y
+    permite monitorear cuántos modelos hay cargados en RAM sin disparar
+    ninguna inferencia ni descarga de datos.
+    """
+    return {
+        "status": "ok",
+        "modelos_en_cache": list(MODEL_CACHE.keys()),
+        "modelos_en_cache_max": MODEL_CACHE_MAX,
+        "productos_con_historico_cacheado": list(DATOS_REALES_CACHE.keys()),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="127.0.0.1", port=8000)
